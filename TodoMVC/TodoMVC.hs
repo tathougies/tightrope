@@ -90,7 +90,8 @@ todoMvc = statefulComp (TodoItemList Nothing mempty) () (\_ -> pure ()) $
           onNewTodo updateComponent _ =
               do kc <- uiKeyCode
                  Just tgt <- target
-                 Just val <- getValue (castToHTMLInputElement tgt)
+                 Just val <- do tgt <- liftIO (castToHTMLInputElement tgt)
+                                getValue tgt
 
                  when (kc == 13) $
                    do liftIO (setValue tgt (Just "" :: Maybe JSString))
