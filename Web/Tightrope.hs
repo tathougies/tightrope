@@ -78,6 +78,16 @@ data DOMInsertPos
 
 newtype AfterAction out = AfterAction [ out -> IO () ]
 
+-- type SnippetConstructor intSt out = DOMInsertPos -> ConstructedSnippet out intSt
+-- type SnippetUpdater intSt out = DOMInsertPos -> internalSt -> ConstructedSnippet out intSt
+-- data ConstructedSnippet out intSt
+--     = ConstructedSnippet
+--     { constructedSnippetOut  :: Endo out
+--     , constructedAfterAction :: AfterAction out
+--     , constructedChildPos    :: DOMInsertPos
+--     , constructedSiblingPos  :: DOMInsertPos
+--     , constructedState       :: intSt }
+--
 type SnippetConstructor internalSt out = StateT DOMInsertPos (WriterT (Endo out, AfterAction out) IO) (DOMInsertPos, internalSt)
 type SnippetUpdater internalSt out = StateT (DOMInsertPos, internalSt) (WriterT (Endo out, AfterAction out) IO) DOMInsertPos
 
@@ -135,9 +145,7 @@ data Embedded index parent current
 
 instance Monoid (AfterAction out) where
     mempty = AfterAction []
-    mappend (AfterAction !a) (AfterAction !b) =
-        let ab = a <> b
-        in ab `seq` AfterAction ab
+    mappend (AfterAction a) (AfterAction b) = AfterAction (a <> b)
 
 runAfterAction :: AfterAction out -> out -> IO ()
 runAfterAction (AfterAction []) out = pure ()
@@ -1190,7 +1198,7 @@ mount_ setChild mkComponent = Snippet createUnder updateElem finish
 
                                                        putMVar stVar (st, intSt')
                                                        putMVar siblingVar (insPos, insPos', childPos)
-                                                       modifyMVar_ outVar $ \_ -> evaluate (mkOut componentEmptyOut)
+                                                       modifyMVar_ outVar $ \_ -> pure (mkOut componentEmptyOut)
                                                        out' <- readMVar outVar
                                                        pure (runAfterAction scheduled out')
                                                   else pure (pure ())
@@ -1302,7 +1310,7 @@ mountComponent el (Component st emptyOut runAlgebra onCreate (Snippet createTemp
                        (st, intSt) <- takeMVar stVar
                        ((_, (_, intSt')), (Endo mkOut, scheduled)) <- runWriterT (runStateT (updateTemplate st) (DOMInsertPos (toNode el) Nothing, intSt))
                        putMVar stVar (st, intSt')
-                       modifyMVar_ outVar $ \_ -> evaluate (mkOut emptyOut)
+                       modifyMVar_ outVar $ \_ -> pure (mkOut emptyOut)
                        out' <- readMVar outVar
                        runAfterAction scheduled out'
 
@@ -1419,27 +1427,26 @@ instance Monad m => Applicative (EnterExitT state out m) where
                  return (f' x')
 instance Monad m => Monad (EnterExitT state out m) where
     a >>= b =
-        EnterExitT $ \ee out !st ->
+        EnterExitT $ \ee out st ->
         do (x, !st') <- runEnterExitT a ee out st
            runEnterExitT (b x) ee out st'
-    return x = EnterExitT $ \_ _ !st -> return (x, st)
+    return x = EnterExitT $ \_ _ st -> return (x, st)
 instance MonadIO m => MonadIO (EnterExitT state out m) where
     liftIO f = parentComponent (liftIO f)
 instance Monad m => MonadReader out (EnterExitT state out m) where
     local f act =
-        EnterExitT $ \ee out !st ->
+        EnterExitT $ \ee out st ->
             runEnterExitT act ee (f out) st
-    ask = EnterExitT $ \ee out !st -> return (out, st)
+    ask = EnterExitT $ \ee out st -> return (out, st)
 instance Monad m => MonadState state (EnterExitT state out m) where
     state f =
-        EnterExitT $ \ee out !st ->
-            let st' = f st
-            in pure (seq st' st')
+        EnterExitT $ \ee out st ->
+            pure (f st)
 
 parentComponent :: MonadIO m => m a -> EnterExitT state out m a
 parentComponent action =
     EnterExitT $ \(EnterExit saveState fetchState) out !st ->
     do saveState st
        x <- action
-       !st' <- fetchState
+       st' <- fetchState
        return (x, st')
