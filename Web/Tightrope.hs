@@ -26,7 +26,7 @@ import Control.Exception (bracket, evaluate)
 
 import Control.Monad.State
 import Control.Monad.Reader
-import Control.Monad.Writer
+--import Control.Monad.Writer
 import Control.Monad hiding (forM_, forM)
 
 import Data.IORef
@@ -60,6 +60,7 @@ import GHCJS.Foreign.Callback
 import GHCJS.Types
 
 import System.Mem.StableName
+import System.IO.Unsafe
 
 type RunAlgebra algebra = forall a. algebra a -> IO a
 type GenericRunAlgebra algebra = forall a m. MonadIO m => algebra a -> m a
@@ -78,18 +79,18 @@ data DOMInsertPos
 
 newtype AfterAction out = AfterAction [ out -> IO () ]
 
--- type SnippetConstructor intSt out = DOMInsertPos -> ConstructedSnippet out intSt
--- type SnippetUpdater intSt out = DOMInsertPos -> internalSt -> ConstructedSnippet out intSt
--- data ConstructedSnippet out intSt
---     = ConstructedSnippet
---     { constructedSnippetOut  :: Endo out
---     , constructedAfterAction :: AfterAction out
---     , constructedChildPos    :: DOMInsertPos
---     , constructedSiblingPos  :: DOMInsertPos
---     , constructedState       :: intSt }
---
-type SnippetConstructor internalSt out = StateT DOMInsertPos (WriterT (Endo out, AfterAction out) IO) (DOMInsertPos, internalSt)
-type SnippetUpdater internalSt out = StateT (DOMInsertPos, internalSt) (WriterT (Endo out, AfterAction out) IO) DOMInsertPos
+type SnippetConstructor intSt out = DOMInsertPos -> IO (ConstructedSnippet intSt out)
+type SnippetUpdater intSt out = DOMInsertPos -> intSt -> IO (ConstructedSnippet intSt out)
+data ConstructedSnippet intSt out
+    = ConstructedSnippet
+    { constructedSnippetOut  :: Endo out
+    , constructedAfterAction :: AfterAction out
+    , constructedSiblingPos  :: DOMInsertPos
+    , constructedChildPos    :: DOMInsertPos
+    , constructedState       :: intSt }
+
+-- type SnippetConstructor internalSt out = StateT DOMInsertPos (WriterT (Endo out, AfterAction out) IO) (DOMInsertPos, internalSt)
+-- type SnippetUpdater internalSt out = StateT (DOMInsertPos, internalSt) (WriterT (Endo out, AfterAction out) IO) DOMInsertPos
 
 data a :++ b = !a :++ !b
 
@@ -102,7 +103,7 @@ data Snippet internalSt out state algebra (parentAlgebra :: * -> *)
 data Attribute attrSt state algebra (parentAlgebra :: * -> *)
     = Attribute
     { attributeSet    :: RunAlgebra algebra -> state -> Node -> IO attrSt
-    , attributeUpdate :: state -> Node -> StateT (DOMInsertPos, attrSt) IO ()
+    , attributeUpdate :: state -> Node -> attrSt -> IO attrSt
     , attributeFinish :: ReaderT attrSt IO () }
 
 data Component (algebra :: * -> *) (parentAlgebra :: * -> *) where
@@ -148,8 +149,9 @@ instance Monoid (AfterAction out) where
     mappend (AfterAction a) (AfterAction b) = AfterAction (a <> b)
 
 runAfterAction :: AfterAction out -> out -> IO ()
-runAfterAction (AfterAction []) out = pure ()
-runAfterAction (AfterAction (x:xs)) out = x out >> runAfterAction (AfterAction xs) out
+runAfterAction act out = go' act out
+    where go' (AfterAction []) out = pure ()
+          go' (AfterAction (x:xs)) out = x out >> go' (AfterAction xs) out
 
 foreign import javascript unsafe "console.log($1, $2, $3);" js_log :: Node -> Node -> Node -> IO ()
 foreign import javascript unsafe "console.log($1, $2);" js_log2 :: Node -> Node -> IO ()
@@ -157,6 +159,45 @@ foreign import javascript unsafe "console.log($1);" js_log1 :: Node -> IO ()
 foreign import javascript unsafe "console.log($1);" js_logEvent :: Event -> IO ()
 loginsertpos (DOMInsertPos parent Nothing) = js_log1 parent
 loginsertpos (DOMInsertPos parent (Just node)) = js_log2 parent node
+
+{-# NOINLINE _animFrameCallbackVar #-}
+_animFrameCallbackVar :: MVar (Maybe RequestAnimationFrameCallback, Maybe Int, [ Double -> IO () ])
+_animFrameCallbackVar =
+    unsafePerformIO (newMVar (Nothing, Nothing, mempty))
+
+requestAnimationFrameHs :: (Double -> IO ()) -> IO ()
+requestAnimationFrameHs doDraw = do
+--  putStrLn "request animation frame"
+  modifyMVar_ _animFrameCallbackVar $ \(cb, existing, reqs) ->
+    do let reqs' = doDraw:reqs
+
+       cb' <-
+           case cb of
+             Just _ -> pure cb
+             Nothing -> Just <$> newRequestAnimationFrameCallback _doRedraw
+       existing' <-
+           case existing of
+             Just _ -> pure existing
+             Nothing -> do
+               Just window <- currentWindow
+--               putStrLn "REquest animation frame js"
+               Just <$> requestAnimationFrame window cb'
+       pure (reqs' `seq` (cb', existing', reqs'))
+--  putStrLn "Done reuest frame"
+
+  where
+    _doRedraw ts =
+        do -- putStrLn "_doRedraw"
+           reqs <- modifyMVar _animFrameCallbackVar $ \(cb, existing, reqs) ->
+                   if null reqs
+                      then pure ((cb, Nothing, mempty), mempty)
+                      else pure ((cb, existing, mempty), reqs)
+--           putStrLn ("Have " <> show (length reqs) <> " to go")
+           if null reqs then {- putStrLn "Done drawing" >> -} pure ()
+              else do
+                forM_ reqs $ \req ->
+                  req ts
+                _doRedraw ts
 
 insertAtPos :: DOMInsertPos -> Node -> IO DOMInsertPos
 insertAtPos (DOMInsertPos parent Nothing) child =
@@ -187,16 +228,15 @@ dynClass className dyn = Attribute set update finish
                    else liftIO (disableClass node)
                  pure enabled
 
-          update st node =
-              do (pos, enabled) <- get
-                 let enabled' = dyn st
+          update st node enabled =
+              do let enabled' = dyn st
 
                  when (enabled' /= enabled) $
                       if enabled'
                       then liftIO (enableClass node)
                       else liftIO (disableClass node)
 
-                 put (pos, enabled')
+                 pure enabled'
 
           finish = pure ()
 
@@ -237,7 +277,7 @@ instance Attrable JSString st where
         where set _ _ n = do n <- castToElement n
                              setAttribute n name val
                              pure ()
-              update _ _ =  pure ()
+              update _ _ =  pure
               finish = pure ()
 
 instance Attrable T.Text st where
@@ -247,14 +287,14 @@ instance Attrable T.Text st where
         where set _ _ n = do n <- castToElement n
                              setAttribute n name val
                              pure ()
-              update _ _ =  pure ()
+              update _ _ =  pure
               finish = pure ()
 
 instance Attrable Bool st where
     type AttrIntState Bool st = AttrIntState JSString st
 
     attr name True = attr name name
-    attr name False = Attribute (\_ _ _ -> pure ()) (\_ _ -> pure ()) (pure ())
+    attr name False = Attribute (\_ _ _ -> pure ()) (\_ _ -> pure) (pure ())
 
 instance (st ~ st', x ~ x', Eq x) => Attrable (x -> Maybe JSString, st -> x') st' where
     type AttrIntState (x -> Maybe JSString, st -> x') st' = x
@@ -268,17 +308,16 @@ instance (st ~ st', x ~ x', Eq x) => Attrable (x -> Maybe JSString, st -> x') st
                          doSet n name curString
                      Nothing -> pure ()
                    pure curValue
-            update st n =
+            update st n curValue =
                 do let newString = mkString newValue
                        newValue = mkValue st
-                   (pos, curValue) <- get
                    when (curValue /= newValue) $
                         case newString of
                           Just newString ->
                               doSet n name newString
                           Nothing ->
                               doRemove n name
-                   put (pos, newValue)
+                   pure newValue
             finish = pure ()
 
             doRemove n name = do n <- liftIO (castToElement n)
@@ -310,7 +349,7 @@ class Stylable x st where
 instance Stylable JSString st where
     type StylableIntState JSString st = ()
 
-    style_ name val = Attribute set (\_ _ -> pure ()) (pure ())
+    style_ name val = Attribute set (\_ _ -> pure) (pure ())
         where set _ _ n = do n <- castToElement n
                              Just style <- getStyle n
                              setProperty style name (Just val) ("" :: JSString)
@@ -338,19 +377,18 @@ instance (st ~ st', x ~ x', Eq x) => Stylable ( x -> Maybe JSString, st -> x' ) 
                        Nothing -> pure ()
                      pure curValue
 
-              update st n =
+              update st n curValue =
                   do let newValueJS = mkString newValue
                          newValue = mkValue st
-                     (pos, curValue) <- get
-                     n <- liftIO (castToElement n)
-                     Just style <- liftIO (getStyle n)
+                     n <- castToElement n
+                     Just style <- getStyle n
                      when (curValue /= newValue) $
                           case newValueJS of
                             Just newValueJS ->
-                                liftIO (setProperty style name (Just newValueJS) ("" :: JSString))
+                                setProperty style name (Just newValueJS) ("" :: JSString)
                             Nothing ->
-                                liftIO (void (removeProperty style name :: IO (Maybe JSString)))
-                     put (pos, newValue)
+                                void (removeProperty style name :: IO (Maybe JSString))
+                     pure newValue
               finish = pure ()
 
 class Ord x => AttrValue x where
@@ -414,9 +452,9 @@ onBodyEvent (EventName evtName) handler =
                runAlgebra' x = lift (runAlgebra x)
            runReaderT (handler runAlgebra' st) =<< fromEvent evt
 
-    update st _ = do (_, (_, stRef)) <- get
-                     liftIO (writeIORef stRef st)
-                     pure ()
+    update st _ intSt@(_, stRef) =
+        do writeIORef stRef st
+           pure intSt
 
     finish = do (release, _) <- ask
                 liftIO release
@@ -449,9 +487,9 @@ onWindowEvent (EventName evtName) handler =
                  runAlgebra' x = lift (runAlgebra x)
              runReaderT (handler runAlgebra' st) =<< fromEvent evt
 
-      update st _ = do (_, (_, stRef)) <- get
-                       liftIO (writeIORef stRef st)
-                       pure mempty
+      update st _ intSt@(_, stRef) =
+          do writeIORef stRef st
+             pure intSt
 
       finish = do (release, _) <- ask
                   liftIO release
@@ -466,26 +504,24 @@ withUpdater :: forall out state algebra parentAlgebra.
             -> Snippet (RunAlgebraWrapper algebra) out state algebra parentAlgebra
 withUpdater set = Snippet set' update (pure ())
     where set' :: RunAlgebra algebra -> state -> SnippetConstructor (RunAlgebraWrapper algebra) out
-          set' update _ =
-              do tell (Endo (set (RunAlgebraWrapper update)), mempty)
-                 pos <- get
-                 pure (pos, RunAlgebraWrapper update)
+          set' update _ pos =
+              pure (ConstructedSnippet (Endo (set (RunAlgebraWrapper update)))
+                                       mempty
+                                       pos pos
+                                       (RunAlgebraWrapper update))
 
-          update _ =
-              do (pos, updater) <- get
-                 tell (Endo (set updater), mempty)
-                 pure pos
+          update _ pos updater =
+              pure (ConstructedSnippet (Endo (set updater)) mempty
+                                       pos pos updater)
 
 onCreate :: forall state algebra out parentAlgebra.
             (state -> algebra ()) -> Snippet () out state algebra parentAlgebra
 onCreate action = Snippet create' update' (pure ())
-    where create' run st =
-              do pos <- get
-                 tell (mempty, AfterAction [ \(_ :: out) -> run (action st) ])
-                 pure (pos, ())
-          update' _ =
-              do (pos, _) <- get
-                 pure pos
+    where create' run st pos =
+              pure (ConstructedSnippet mempty (AfterAction [ const (run (action st)) ])
+                                       pos pos ())
+          update' _ pos () =
+              pure (ConstructedSnippet mempty mempty pos pos ())
 
 afterDraw :: forall state out algebra parentAlgebra.
              (RunAlgebra algebra -> state -> out -> IO ())
@@ -494,14 +530,12 @@ afterDraw action =
     Snippet create' update' (pure ())
   where
     create' :: RunAlgebra algebra -> state -> SnippetConstructor (RunAlgebraWrapper algebra) out
-    create' run st =
-        do pos <- get
-           tell (mempty, AfterAction [ \out -> action run st out ])
-           pure (pos, RunAlgebraWrapper run)
-    update' st =
-        do (pos, RunAlgebraWrapper run) <- get
-           tell (mempty, AfterAction [ \out -> action run st out ])
-           pure pos
+    create' run st pos =
+        pure (ConstructedSnippet mempty (AfterAction [ \out -> action run st out ])
+                                 pos pos (RunAlgebraWrapper run))
+    update' st pos run'@(RunAlgebraWrapper run) =
+        pure (ConstructedSnippet mempty (AfterAction [ \out -> action run st out ])
+                                 pos pos run')
 
 -- onChanges :: forall state key algebra parentAlgebra.
 --              Eq key => (state -> key) -> (state -> algebra ())
@@ -541,8 +575,9 @@ customHandler attachHandler detachHandler handler =
 
            pure (detachHandler n listener, stRef)
 
-    update st _ = do (_, (_, stRef)) <- get
-                     liftIO (writeIORef stRef st)
+    update st _ intSt@(_, stRef) =
+        do writeIORef stRef st
+           pure intSt
 
     finish = do (release, _) <- ask
                 liftIO release
@@ -575,34 +610,35 @@ on (EventName evtName) handler =
                runAlgebra' x = liftIO (runAlgebra x)
            runReaderT (handler runAlgebra' st) =<< fromEvent evt
 
-    update st _ = do (_, (_, stRef)) <- get
-                     liftIO (writeIORef stRef st)
-                     pure mempty
+    update st _ intSt@(_, stRef) =
+        do writeIORef stRef st
+           pure intSt
+
     finish = do (release, _) <- ask
                 liftIO release
 
 raw_ :: (st -> JSString) -> Snippet Node out st algebra parentAlgebra
 raw_ mkHtml = Snippet createUnder updateElem finish
     where
-      createUnder _ st =
-          do el <- liftIO (mkEl (mkHtml st))
+      createUnder _ st insertPos =
+          do el <- mkEl (mkHtml st)
 
-             insertPos <- get
-             insertPos' <- liftIO (insertAtPos insertPos (toNode el))
-             put insertPos'
+             insertPos' <- insertAtPos insertPos (toNode el)
 
-             pure (DOMInsertPos (toNode el) Nothing, el)
+             pure (ConstructedSnippet mempty mempty
+                                      insertPos'
+                                      (DOMInsertPos (toNode el) Nothing)
+                                      el)
 
-      updateElem st =
-          do (insertPos, el) <- get
+      updateElem st insertPos el =
+          do finish' el
 
-             liftIO (finish' el)
+             el' <- mkEl (mkHtml st)
+             insertPos' <- insertAtPos insertPos (toNode el')
 
-             el' <- liftIO (mkEl (mkHtml st))
-             insertPos' <- liftIO (insertAtPos insertPos (toNode el'))
-             put (insertPos', el')
-
-             pure (DOMInsertPos (toNode el') Nothing)
+             pure (ConstructedSnippet mempty mempty
+                                      insertPos'
+                                      (DOMInsertPos (toNode el') Nothing) el')
 
       finish = do el <- ask
                   liftIO (finish' el)
@@ -631,21 +667,21 @@ raw_ mkHtml = Snippet createUnder updateElem finish
 el :: JSString -> Snippet Element out st algebra parentAlgebra
 el tagName = Snippet createUnder updateElem finish
   where
-    createUnder _ _ =
+    createUnder _ _ insertPos =
       do Just document <- liftIO currentDocument
 
          Just el <- createElement document (Just tagName)
 
-         insertPos <- get
          insertPos' <- liftIO (insertAtPos insertPos (toNode el))
-         put insertPos'
+         pure (ConstructedSnippet mempty mempty
+                                  insertPos' (DOMInsertPos (toNode el) Nothing)
+                                  el)
 
-         pure (DOMInsertPos (toNode el) Nothing, el)
-
-    updateElem _ =
-      do (_, el) <- get
-         modify $ \(DOMInsertPos parent _, st) -> (DOMInsertPos parent (Just (toNode el)), st)
-         pure (DOMInsertPos (toNode el) Nothing)
+    updateElem _ (DOMInsertPos parent _) el=
+      pure (ConstructedSnippet mempty mempty
+                               (DOMInsertPos parent (Just (toNode el)))
+                               (DOMInsertPos (toNode el) Nothing)
+                               el)
 
     finish =
       do el <- ask
@@ -660,21 +696,19 @@ el tagName = Snippet createUnder updateElem finish
 text :: JSString -> Snippet Node out st algebra parentAlgebra
 text str = Snippet createUnder updateElem finish
   where
-    createUnder _ _ =
+    createUnder _ _ insertPos =
       do Just document <- liftIO currentDocument
 
          Just el <- createTextNode document str
 
-         insertPos <- get
          insertPos' <- liftIO (insertAtPos insertPos (toNode el))
-         put insertPos'
+         pure (ConstructedSnippet mempty mempty
+                                  insertPos' (DOMInsertPos (toNode el) Nothing) (toNode el))
 
-         pure (DOMInsertPos (toNode el) Nothing, toNode el)
-
-    updateElem _ =
-      do (_, el) <- get
-         modify $ \(DOMInsertPos parent _, st) -> (DOMInsertPos parent (Just (toNode el)), st)
-         pure (DOMInsertPos (toNode el) Nothing)
+    updateElem _ (DOMInsertPos parent _) el =
+      pure (ConstructedSnippet mempty mempty
+                               (DOMInsertPos parent (Just (toNode el))) (DOMInsertPos (toNode el) Nothing)
+                               el)
 
     finish =
       do el <- ask
@@ -689,35 +723,35 @@ text str = Snippet createUnder updateElem finish
 dyn = dyn' id
 dynText = dyn' textToJSString
 
-dyn' :: Eq s => (s -> JSString) -> (state -> s) -> Snippet (Text, s) out state algebra parentAlgebra
+dyn' :: Eq s => (s -> JSString) -> (state -> s) -> Snippet (Text :++ s) out state algebra parentAlgebra
 dyn' toString fromState = Snippet createUnder updateElem finish
   where
-    createUnder _ st =
+    createUnder _ st insertPos =
         do Just document <- liftIO currentDocument
 
            let str = toString strInt
                strInt = fromState st
            Just el <- createTextNode document str
 
-           insertPos <- get
            insertPos' <- liftIO (insertAtPos insertPos (toNode el))
-           put insertPos'
 
-           pure (DOMInsertPos (toNode el) Nothing, (el, strInt))
+           pure (ConstructedSnippet mempty mempty
+                                    insertPos'
+                                    (DOMInsertPos (toNode el) Nothing)
+                                    (el :++ strInt))
 
-    updateElem st =
-        do (_, (txt, str)) <- get
-
-           let str' = toString stInt
+    updateElem st (DOMInsertPos parent _) (txt :++ str) =
+        do let str' = toString stInt
                stInt = fromState st
-           modify $ \(DOMInsertPos parent _, st) -> (DOMInsertPos parent (Just (toNode txt)), st)
            when (str /= stInt) $
-              do setNodeValue txt (Just str')
-                 modify $ \(pos, (txt, _)) -> (pos, (txt, stInt))
-           pure (DOMInsertPos (toNode txt) Nothing)
+                do setNodeValue txt (Just str')
+           pure (ConstructedSnippet mempty mempty
+                                    (DOMInsertPos parent (Just (toNode txt)))
+                                    (DOMInsertPos (toNode txt) Nothing)
+                                    (txt :++ stInt))
 
     finish =
-        do (txt, _) <- ask
+        do (txt :++ _) <- ask
            Just parent <- getParentNode txt
            removeChild parent (Just txt)
            pure ()
@@ -726,12 +760,12 @@ project_ :: (st -> st')
          -> Snippet intSt out st' algebra parentAlgebra
          -> Snippet intSt out st algebra parentAlgebra
 project_ f (Snippet createElem updateElem finishElem) =
-    Snippet (\run st -> createElem run (f st))
-            (updateElem . f)
+    Snippet (\run st pos -> createElem run (f st) pos)
+            (\st pos intSt -> updateElem (f st) pos intSt)
             finishElem
 
 enum_ :: forall state ix intSt algebra parentAlgebra out.
-         (Enum ix, Ord ix) =>
+         (Enum ix, Ord ix, Show ix) =>
          (state -> (ix, ix))
       -> Snippet intSt out (Embedded ix state ix) algebra parentAlgebra
       -> Snippet (RunAlgebraWrapper algebra, ix, ix, [intSt]) out state algebra parentAlgebra
@@ -739,21 +773,38 @@ enum_ mkBounds (Snippet createItem updateItem finishItem) =
     Snippet createItems updateItems finishItems
   where
     createItems :: RunAlgebra algebra -> state -> SnippetConstructor (RunAlgebraWrapper algebra, ix, ix, [intSt]) out
-    createItems runAlgebra state =
+    createItems runAlgebra state pos =
         do let (start, end) = mkBounds state
 
-           intSt <- forM [start..end] $ \i ->
-                    snd <$> createItem runAlgebra (Embedded state i i)
+           res <- createAll runAlgebra state start (start, end) (ConstructedSnippet mempty mempty pos pos id)
+           pure (res { constructedState = (RunAlgebraWrapper runAlgebra, start, end, constructedState res []) })
 
-           pos <- get
-           liftIO (putStrLn "Done creating")
-           pure (pos, (RunAlgebraWrapper runAlgebra, start, end, intSt))
+    createAll :: RunAlgebra algebra -> state -> ix -> (ix, ix)
+              -> ConstructedSnippet ([intSt] -> [intSt]) out
+              -> IO (ConstructedSnippet ([intSt] -> [intSt]) out)
+    createAll runAlgebra state !ix (start, end) a
+        | start > end || ix > end =
+            pure a
+    createAll runAlgebra state !ix bounds@(start, end) (ConstructedSnippet mkOut scheduled siblingPos _ a) =
+        do ConstructedSnippet itemMkOut itemScheduled siblingPos' childPos' itemIntSt <-
+               createItem runAlgebra (Embedded state ix ix) siblingPos
+           createAll runAlgebra state (succ ix) bounds
+                     (ConstructedSnippet (mkOut <> itemMkOut) (scheduled <> itemScheduled)
+                                         siblingPos' childPos' (a . (itemIntSt :)))
+
+    updateAll :: state -> ix -> [intSt] -> ConstructedSnippet ([intSt] -> [intSt]) out
+              -> IO (ConstructedSnippet ([intSt] -> [intSt]) out)
+    updateAll _ !ix [] a = pure a
+    updateAll state !ix (item:items) (ConstructedSnippet mkOut scheduled siblingPos _ a) =
+        do ConstructedSnippet itemMkOut itemScheduled siblingPos' childPos' itemIntSt' <-
+               updateItem (Embedded state ix ix) siblingPos item
+           updateAll state (succ ix) items (ConstructedSnippet (mkOut <> itemMkOut) (scheduled <> itemScheduled)
+                                                               siblingPos' childPos'
+                                                               (a . (itemIntSt' :)))
 
     updateItems :: state -> SnippetUpdater (RunAlgebraWrapper algebra, ix, ix, [intSt]) out
-    updateItems state =
-        do (_, (runAlgebra@(RunAlgebraWrapper runAlgebra_), oldStart, oldEnd, intSts)) <- get
-
-           let (newStart, newEnd) = mkBounds state
+    updateItems state pos (runAlgebra@(RunAlgebraWrapper runAlgebra_), oldStart, oldEnd, intSts) =
+        do let (newStart, newEnd) = mkBounds state
 
                newStartIdx = fromEnum newStart
                newEndIdx   = fromEnum newEnd
@@ -764,16 +815,16 @@ enum_ mkBounds (Snippet createItem updateItem finishItem) =
                ( (removeFromBeginning, addToBeginning),
                  (removeFromEnd,       addToEnd) )
                  | newEndIdx < newStartIdx =
-                     ( (length intSts, []), (0, []) )
+                     ( (length intSts, (succ newStart, newStart)), (0, (succ newEnd, newEnd)) )
                  | newEndIdx < oldStartIdx = -- scrolled up all the way
-                     ( (length intSts, [newStart..newEnd]), (0, []) )
+                     ( (length intSts, (newStart, newEnd)), (0, (succ newEnd, newEnd)) )
                  | newStartIdx > oldEndIdx = -- scrolled down all the way
-                     ( (length intSts, [newStart..newEnd]), (0, []) )
+                     ( (length intSts, (newStart, newEnd)), (0, (succ newEnd, newEnd)) )
                  | otherwise =
-                     let beginning | newStartIdx < oldStartIdx = ( 0, [newStart..pred oldStart] )
-                                   | otherwise = ( newStartIdx - oldStartIdx, [] )
-                         end       | newEndIdx > oldEndIdx = ( 0, [succ oldEnd..newEnd] )
-                                   | otherwise = ( oldEndIdx - newEndIdx, [] )
+                     let beginning | newStartIdx < oldStartIdx = ( 0, (newStart, pred oldStart) )
+                                   | otherwise = ( newStartIdx - oldStartIdx, (succ newStart, newStart) )
+                         end       | newEndIdx > oldEndIdx = ( 0, (succ oldEnd, newEnd) )
+                                   | otherwise = ( oldEndIdx - newEndIdx, (succ newEnd, newEnd) )
                      in (beginning, end)
 
                intStsLength = length intSts
@@ -786,28 +837,11 @@ enum_ mkBounds (Snippet createItem updateItem finishItem) =
            forM_ (removedFromBeginning <> removedFromEnd) $ \st ->
                liftIO (runReaderT finishItem st)
 
-           addedAtBeginningSts <- forM addToBeginning $ \i ->
-                                  do (insertPos, intSt) <- get
-                                     ((_, itemIntSt), insertPos') <- lift (runStateT (createItem runAlgebra_ (Embedded state i i)) insertPos)
-                                     put (insertPos', intSt)
-                                     pure itemIntSt
+           beginning <- createAll runAlgebra_ state (fst addToBeginning) addToBeginning (ConstructedSnippet mempty mempty pos pos id)
+           updated <- updateAll state preservedStart preservedSts beginning
+           end <- createAll runAlgebra_ state (fst addToEnd) addToEnd updated
 
-           updatedSts <- forM (zip [preservedStart..] preservedSts) $ \(i, itemIntSt) ->
-                         do (insertPos, intSt) <- get
-                            (_, (insertPos', itemIntSt')) <- lift (runStateT (updateItem (Embedded state i i)) (insertPos, itemIntSt))
-                            put (insertPos', intSt)
-                            pure itemIntSt'
-
-           addedAtEndSts <- forM addToEnd $ \i ->
-                            do (insertPos, intSt) <- get
-                               ((_, itemIntSt), insertPos') <- lift (runStateT (createItem runAlgebra_ (Embedded state i i)) insertPos)
-                               put (insertPos', intSt)
-                               pure itemIntSt
-
-           (pos, _) <- get
-           put (pos, (runAlgebra, newStart, newEnd, addedAtBeginningSts <> updatedSts <> addedAtEndSts))
-
-           pure pos
+           pure (end { constructedState = (runAlgebra, newStart, newEnd, constructedState end []) })
 
     finishItems =
       do (_, _, _, intSts) <- ask
@@ -821,44 +855,42 @@ repeat_ mkCurrent (Snippet createItem updateItem finishItem) =
     Snippet createItems updateItems finishItems
   where
     createItems :: RunAlgebra algebra -> state -> SnippetConstructor (RunAlgebraWrapper algebra, [intSt]) out
-    createItems runAlgebra state =
+    createItems runAlgebra state siblingPos =
         do let current = mkCurrent state
+           createAll runAlgebra state 0 current (ConstructedSnippet mempty mempty siblingPos siblingPos id)
 
-           intSt <- forM (zip [0..] current) $ \(i, item) ->
-                    snd <$> createItem runAlgebra (Embedded state item i)
+    createAll :: RunAlgebra algebra -> state -> Int -> [current] -> ConstructedSnippet ([intSt] -> [intSt]) out
+              -> IO (ConstructedSnippet (RunAlgebraWrapper algebra, [intSt]) out)
+    createAll runAlgebra _ !ix [] (ConstructedSnippet mkOut scheduled siblingPos' childPos a) =
+        pure (ConstructedSnippet mkOut scheduled siblingPos' childPos (RunAlgebraWrapper runAlgebra, a []))
+    createAll runAlgebra state !ix (item:items) (ConstructedSnippet mkOut scheduled siblingPos' _ a) =
+        do ConstructedSnippet itemMkOut itemScheduled siblingPos'' childPos' itemIntSt <-
+               createItem runAlgebra (Embedded state item ix) siblingPos'
+           createAll runAlgebra state (ix + 1) items (ConstructedSnippet (mkOut <> itemMkOut) (scheduled <> itemScheduled) siblingPos'' childPos' (a . (itemIntSt:)))
 
-           pos <- get
+    updateAll _ !_ [] _ a = pure a
+    updateAll _ !_ _ [] a = pure a
+    updateAll state !ix (current:currents) (itemIntSt:itemIntSts) (ConstructedSnippet mkOut scheduled siblingPos _ a) =
+        do ConstructedSnippet itemMkOut itemScheduled siblingPos' childPos' itemIntSt' <-
+               updateItem (Embedded state current ix) siblingPos itemIntSt
 
-           pure (pos, (RunAlgebraWrapper runAlgebra, intSt))
+           updateAll state (ix + 1) currents itemIntSts
+                     (ConstructedSnippet (mkOut <> itemMkOut) (scheduled <> itemScheduled)
+                                         siblingPos' childPos'
+                                         (a . (itemIntSt':)))
 
     updateItems :: state -> SnippetUpdater (RunAlgebraWrapper algebra, [intSt]) out
-    updateItems state =
-        do (_, (runAlgebra@(RunAlgebraWrapper runAlgebra_), intSt)) <- get
-
-           let current  = mkCurrent state
+    updateItems state pos (runAlgebra@(RunAlgebraWrapper runAlgebra_), intSt) =
+        do let current  = mkCurrent state
                (intSt', toRemove) = splitAt (length current) intSt
                toAdd = drop (length intSt') current
 
-           updatedIntSts <-
-               forM (zip3 [0..] current intSt') $ \(i, itemSt, itemIntSt) ->
-               do (insertPos, intSt) <- get
-                  (_, (insertPos', itemIntSt')) <- lift (runStateT (updateItem (Embedded state itemSt i)) (insertPos, itemIntSt))
-                  put (insertPos', intSt)
-                  pure itemIntSt'
 
            forM_ toRemove $ \intSt ->
                liftIO (runReaderT finishItem intSt)
 
-           addedIntSts <- forM (zip [length intSt'..] toAdd) $ \(i, itemSt) ->
-               do (insertPos, intSt) <- get
-                  ((_, itemIntSt), insertPos') <- lift (runStateT (createItem runAlgebra_ (Embedded state itemSt i)) insertPos)
-                  put (insertPos', intSt)
-                  pure itemIntSt
-
-           let newIntSts = updatedIntSts ++ addedIntSts
-           (pos, _) <- get
-           put (pos, (runAlgebra, newIntSts))
-           pure pos
+           createAll runAlgebra_ state (length intSt') toAdd =<<
+            updateAll state 0 current intSt' (ConstructedSnippet mempty mempty pos pos id)
 
     finishItems =
         do (_, intSts) <- ask
@@ -877,14 +909,12 @@ attrKeyedUpdates_ mkKey (Attribute set update finish) = Attribute set' update' f
              x <- set runAlgebra key node
              pure (key, x)
 
-      update' st node =
-          do (pos, (oldKey, x)) <- get
-             let newKey = mkKey st
-             if oldKey /= newKey
-                then do
-                  ((), (pos', x')) <- lift (runStateT (update newKey node) (pos, x))
-                  put (pos', (newKey, x'))
-                else pure ()
+      update' st node oldIntSt@(oldKey, x)=
+          let newKey = mkKey st
+          in if oldKey /= newKey
+             then do x' <- update newKey node x
+                     pure (newKey, x')
+             else pure oldIntSt
 
       finish' = do (_, x) <- ask
                    lift (runReaderT finish x)
@@ -898,31 +928,23 @@ keyedUpdates_ mkKey (Snippet createUnder updateElem finish) =
   where
     createUnder' :: RunAlgebra algebra -> state
                  -> SnippetConstructor (key, DOMInsertPos, DOMInsertPos, Endo out, internalSt) out
-    createUnder' update st =
-        do siblingPos <- get
+    createUnder' update st siblingPos =
+        do ConstructedSnippet mkOut scheduled siblingPos' pos internalSt <-
+               createUnder update st siblingPos
 
-           (((pos, internalSt), siblingPos'), (mkOut, scheduled)) <-
-               lift (lift (runWriterT (runStateT (createUnder update st) siblingPos)))
+           pure (ConstructedSnippet mkOut scheduled siblingPos' pos
+                                    (mkKey st, pos, siblingPos', mkOut, internalSt))
 
-           put siblingPos'
-           tell (mkOut, scheduled)
-
-           pure (pos, (mkKey st, pos, siblingPos', mkOut, internalSt))
-
-    updateElem' st =
-        do (siblingPos, oldSt@(oldKey, oldPos, oldSiblingPos, oldMkOut, oldInternalSt)) <- get
-
-           let newKey = mkKey st
-           if oldKey == newKey
-              then do put (oldSiblingPos, oldSt)
-                      tell (oldMkOut, mempty)
-                      pure oldPos
-              else do ((pos, (siblingPos', internalSt')), (mkOut, scheduled)) <- lift (lift (runWriterT (runStateT (updateElem st) (siblingPos, oldInternalSt))))
-
-                      put (siblingPos', (newKey, pos, siblingPos', mkOut, internalSt'))
-                      tell (mkOut, scheduled)
-
-                      pure pos
+    updateElem' st siblingPos oldSt@(oldKey, oldPos, oldSiblingPos, oldMkOut, oldInternalSt) =
+        let newKey = mkKey st
+        in if oldKey == newKey
+           then pure (ConstructedSnippet oldMkOut mempty
+                                         oldSiblingPos oldPos
+                                         oldSt)
+           else do ConstructedSnippet mkOut scheduled siblingPos' pos internalSt' <-
+                       updateElem st siblingPos oldInternalSt
+                   pure (ConstructedSnippet mkOut scheduled siblingPos' pos
+                                            (newKey, pos, siblingPos', mkOut, internalSt'))
 
     finish' = do (_, _, _, _, st) <- ask
                  lift (runReaderT finish st)
@@ -935,31 +957,33 @@ switch_ mkKey mkComponent =
     Snippet createUnder' updateElem' finish'
   where createUnder' :: RunAlgebra algebra -> state
                      -> SnippetConstructor (key, RenderedSnippet out state, RunAlgebraWrapper algebra) out
-        createUnder' update st =
-            do let initialKey = mkKey st
-               case mkComponent st initialKey of
+        createUnder' update st pos =
+            let initialKey = mkKey st
+            in case mkComponent st initialKey of
                  SomeSnippet (Snippet createUnder updateElem finish) ->
-                     do (pos, intSt) <- createUnder update st
+                     do ConstructedSnippet mkOut after siblingPos childPos intSt <-
+                            createUnder update st pos
 
                         let intSt' = RenderedSnippet intSt updateElem finish
+                        pure (ConstructedSnippet mkOut after siblingPos childPos
+                                                 (initialKey, intSt', RunAlgebraWrapper update))
 
-                        pure (pos, (initialKey, intSt', RunAlgebraWrapper update))
-
-        updateElem' st =
-            do let !key = mkKey st
-               (siblingPos, (oldKey, rendered, RunAlgebraWrapper update)) <- get
-               case rendered of
+        updateElem' st siblingPos (oldKey, rendered, RunAlgebraWrapper update) =
+            let !key = mkKey st
+            in case rendered of
                  RenderedSnippet intSt updateElem finish ->
                      if key == oldKey
-                     then do (childPos, (siblingPos', intSt')) <- lift (runStateT (updateElem st) (siblingPos, intSt))
-                             put (siblingPos', (key, RenderedSnippet intSt' updateElem finish, RunAlgebraWrapper update))
-                             pure childPos
-                     else do lift (lift (runReaderT finish intSt))
+                     then do ConstructedSnippet mkOut scheduled siblingPos' childPos intSt' <-
+                                 updateElem st siblingPos intSt
+                             pure (ConstructedSnippet mkOut scheduled siblingPos' childPos
+                                                      (key, RenderedSnippet intSt' updateElem finish, RunAlgebraWrapper update))
+                     else do runReaderT finish intSt
                              case mkComponent st key of
                                SomeSnippet (Snippet createUnder updateElem finish) ->
-                                   do ((childPos, intSt), siblingPos') <- lift (runStateT (createUnder update st) siblingPos)
-                                      put (siblingPos', (key, RenderedSnippet intSt updateElem finish, RunAlgebraWrapper update))
-                                      pure childPos
+                                   do ConstructedSnippet mkOut after siblingPos' childPos intSt <-
+                                          createUnder update st siblingPos
+                                      pure (ConstructedSnippet mkOut after siblingPos' childPos
+                                                               (key, RenderedSnippet intSt updateElem finish, RunAlgebraWrapper update))
 
         finish' = do (_, RenderedSnippet st _ finish, _) <- ask
                      lift (runReaderT finish st)
@@ -978,31 +1002,34 @@ guarded_ :: forall state state' childEl out algebra parentAlgebra.
 guarded_ check (Snippet createUnder updateElem finish) =
     Snippet createUnder' updateElem' finish'
   where createUnder' :: RunAlgebra algebra -> state -> SnippetConstructor (Maybe childEl, RunAlgebraWrapper algebra) out
-        createUnder' update st =
+        createUnder' update st siblingPos =
             case check st of
               Just st' ->
-                  do (pos, intSt) <- createUnder update (Embedded st st' ())
-                     pure (pos, (Just intSt, RunAlgebraWrapper update))
-              Nothing -> do pos <- get
-                            pure (pos, (Nothing, RunAlgebraWrapper update))
+                  do ConstructedSnippet mkOut scheduled siblingPos' childPos intSt <-
+                         createUnder update (Embedded st st' ()) siblingPos
+                     pure (ConstructedSnippet mkOut scheduled siblingPos' childPos
+                                              (Just intSt, RunAlgebraWrapper update))
+              Nothing -> pure (ConstructedSnippet mempty mempty
+                                                  siblingPos siblingPos
+                                                  (Nothing, RunAlgebraWrapper update))
 
-        updateElem' st =
-            do (pos, (intSt, RunAlgebraWrapper update)) <- get
-               case (check st, intSt) of
-                 (Nothing, Nothing) -> pure pos
-                 (Just st', Nothing) ->
-                     do ((childPos, intSt'), siblingPos) <- lift (runStateT (createUnder update (Embedded st st' ())) pos)
-                        put (siblingPos, (Just intSt', RunAlgebraWrapper update))
-
-                        pure childPos
-                 (Nothing, Just childSt) ->
-                     do liftIO (runReaderT finish childSt)
-                        put (pos, (Nothing, RunAlgebraWrapper update))
-                        pure pos
-                 (Just st', Just childSt) ->
-                     do (childPos, (siblingPos, intSt')) <- lift (runStateT (updateElem (Embedded st st' ())) (pos, childSt))
-                        pure (siblingPos, (Just intSt', RunAlgebraWrapper update))
-                        pure childPos
+        updateElem' st pos (intSt, RunAlgebraWrapper update) =
+            case (check st, intSt) of
+              (Nothing, Nothing) ->
+                  pure (ConstructedSnippet mempty mempty pos pos (intSt, RunAlgebraWrapper update))
+              (Just st', Nothing) ->
+                  do ConstructedSnippet mkOut scheduled siblingPos' childPos intSt' <-
+                         createUnder update (Embedded st st' ()) pos
+                     pure (ConstructedSnippet mkOut scheduled siblingPos' childPos
+                                              (Just intSt', RunAlgebraWrapper update))
+              (Nothing, Just childSt) ->
+                  do runReaderT finish childSt
+                     pure (ConstructedSnippet mempty mempty pos pos (Nothing, RunAlgebraWrapper update))
+              (Just st', Just childSt) ->
+                  do ConstructedSnippet mkOut scheduled siblingPos' childPos intSt' <-
+                         updateElem (Embedded st st' ()) pos childSt
+                     pure (ConstructedSnippet mkOut scheduled siblingPos' childPos
+                                              (Just intSt', RunAlgebraWrapper update))
 
         finish' =
             do (intSt, _) <- ask
@@ -1020,14 +1047,14 @@ Attribute setLeft updateLeft finishLeft |++ Attribute setRight updateRight finis
   where
     set :: RunAlgebra algebra -> st -> Node -> IO (left :++ right)
     set runAlgebra st node =
-        (:++) <$> setLeft runAlgebra st node
-              <*> setRight runAlgebra st node
+        do left <- setLeft runAlgebra st node
+           right <- setRight runAlgebra st node
+           pure (left :++ right)
 
-    update st node =
-        do (pos, (left :++ right)) <- get
-           ((), (pos', left')) <- lift (runStateT (updateLeft st node) (pos, left))
-           ((), (pos'', right')) <- lift (runStateT (updateRight st node) (pos', right))
-           put (pos'', (left' :++ right'))
+    update st node (left :++ right) =
+        do left' <- updateLeft st node left
+           right' <- updateRight st node right
+           pure (left' :++ right')
 
     finish = do (left :++ right) <- ask
                 lift (runReaderT finishLeft left)
@@ -1040,34 +1067,34 @@ Attribute setLeft updateLeft finishLeft |++ Attribute setRight updateRight finis
 Snippet createLeft updateLeft finishLeft |<> Snippet createRight updateRight finishRight =
   Snippet createUnder updateElem finish
   where createUnder :: RunAlgebra algebra -> state -> SnippetConstructor (leftEl :++ rightEl) out
-        createUnder runAlgebra st =
-            do (left, leftIntSt) <- createLeft runAlgebra st
-               (right, rightIntSt) <- createRight runAlgebra st
+        createUnder runAlgebra st siblingPos =
+            do ConstructedSnippet leftOut leftScheduled siblingPos' _ !leftIntSt <-
+                   createLeft runAlgebra st siblingPos
+               ConstructedSnippet rightOut rightScheduled siblingPos'' childPos !rightIntSt <-
+                   createRight runAlgebra st siblingPos'
+               pure (ConstructedSnippet (leftOut <> rightOut) (leftScheduled <> rightScheduled)
+                                        siblingPos'' childPos (leftIntSt :++ rightIntSt))
 
-               pure (right, (leftIntSt :++ rightIntSt))
-
-        updateElem st =
-            do (siblingInsertPos, (leftIntSt :++ rightIntSt)) <- get
-
-               (left, (siblingInsertPos', leftIntSt')) <- lift (runStateT (updateLeft st) (siblingInsertPos, leftIntSt))
-               (right, (siblingInsertPos'', rightIntSt')) <- lift (runStateT (updateRight st) (siblingInsertPos', rightIntSt))
-
-               put (siblingInsertPos'', (leftIntSt' :++ rightIntSt'))
-
-               pure left
+        updateElem st siblingPos (leftIntSt :++ rightIntSt) =
+            do ConstructedSnippet leftOut leftScheduled siblingPos' _ !leftIntSt' <-
+                   updateLeft st siblingPos leftIntSt
+               ConstructedSnippet rightOut rightScheduled siblingPos'' childPos !rightIntSt' <-
+                   updateRight st siblingPos' rightIntSt
+               pure (ConstructedSnippet (leftOut <> rightOut) (leftScheduled <> rightScheduled)
+                                        siblingPos'' childPos (leftIntSt' :++ rightIntSt'))
 
         finish =
             do (leftSt :++ rightSt) <- ask
                lift (runReaderT finishLeft leftSt)
                lift (runReaderT finishRight rightSt)
 
--- {-# INLINE (|-*) #-}
+{-# INLINE (|-*) #-}
 (|-*) :: Snippet parentEl out state algebra parentAlgebra
       -> SomeSnippet out state algebra parentAlgebra
       -> Snippet (parentEl :++ RenderedSnippet out state) out state algebra parentAlgebra
 parent |-* child = parent |- someSnippet_ child
 
--- {-# INLINE (|-) #-}
+{-# INLINE (|-) #-}
 (|-) :: forall parentEl childEl state algebra parentAlgebra out.
         Snippet parentEl out state algebra parentAlgebra
      -> Snippet childEl out state algebra parentAlgebra
@@ -1075,21 +1102,25 @@ parent |-* child = parent |- someSnippet_ child
 Snippet createParent updateParent finishParent |- Snippet createChild updateChild finishChild =
   Snippet createUnder' updateElem' finish'
   where createUnder' :: RunAlgebra algebra -> state -> SnippetConstructor (parentEl :++ childEl) out
-        createUnder' runAlgebra st =
-          do (parent@(DOMInsertPos parentNode _), !parentIntSt) <- createParent runAlgebra st
-             ((_, !childIntSt), parent') <- lift (runStateT (createChild runAlgebra st) parent)
+        createUnder' runAlgebra st pos =
+          do ConstructedSnippet parentOut parentScheduled
+                                siblingPos parentChildPos !parentIntSt <-
+                                    createParent runAlgebra st pos
+             ConstructedSnippet childOut childScheduled
+                                childPos' _ !childIntSt <-
+                                    createChild runAlgebra st parentChildPos
+             pure (ConstructedSnippet (parentOut <> childOut) (parentScheduled <> childScheduled)
+                                      siblingPos childPos' (parentIntSt :++ childIntSt))
 
-             return (parent', (parentIntSt :++ childIntSt))
-
-        updateElem' st =
-          do (siblingInsertPos, (parentIntSt :++ childIntSt)) <- get
-
-             (parentInsertPos@(DOMInsertPos parentNode _), (!siblingInsertPos', !parentIntSt')) <- lift (runStateT (updateParent st) (siblingInsertPos, parentIntSt))
-             (_, (parentInsertPos', !childIntSt')) <- lift (runStateT (updateChild st) (parentInsertPos, childIntSt))
-
-             put (siblingInsertPos', (parentIntSt' :++ childIntSt'))
-
-             pure parentInsertPos'
+        updateElem' st siblingInsertPos (parentIntSt :++ childIntSt) =
+          do ConstructedSnippet parentOut parentScheduled
+                                siblingInsertPos' parentChildPos !parentIntSt' <-
+                                    updateParent st siblingInsertPos parentIntSt
+             ConstructedSnippet childOut childScheduled
+                                childPos' _ !childIntSt' <-
+                                    updateChild st parentChildPos childIntSt
+             pure (ConstructedSnippet (parentOut <> childOut) (parentScheduled <> childScheduled)
+                                      siblingInsertPos' childPos' (parentIntSt' :++ childIntSt'))
 
         finish' =
           do (parentSt :++ childSt) <- ask
@@ -1106,23 +1137,20 @@ infixl 1 |-, |-*
 Snippet createUnder updateElem finishElem |+ Attribute setAttr updateAttr finishAttr =
   Snippet createUnder' updateElem' finish'
   where createUnder' :: RunAlgebra algebra -> state -> SnippetConstructor (elSt :++ attrSt) out
-        createUnder' runAlgebra st =
-          do insertPos <- get
+        createUnder' runAlgebra st insertPos =
+          do ConstructedSnippet elOut elAfter siblingPos childPos !elIntSt <-
+                 createUnder runAlgebra st insertPos
+             !attrSt <- setAttr runAlgebra st (insertPosParent childPos)
 
-             (el, !elIntSt) <- createUnder runAlgebra st
-             !attrSt <- liftIO (setAttr runAlgebra st (insertPosParent el))
+             pure (ConstructedSnippet elOut elAfter
+                                      siblingPos childPos (elIntSt :++ attrSt))
 
-             pure (el, (elIntSt :++ attrSt))
+        updateElem' st insertPos (elSt :++ attrSt) =
+          do ConstructedSnippet elOut elAfter siblingPos childPos !elSt' <-
+                 updateElem st insertPos elSt
+             !attrSt' <- updateAttr st (insertPosParent childPos) attrSt
 
-        updateElem' st =
-          do (insertPos, (elSt :++ attrSt)) <- get
-
-             (parentInsertPos, (insertPos', !elSt')) <- lift (runStateT (updateElem st) (insertPos, elSt))
-             ((), (insertPos'', !attrSt')) <- liftIO (runStateT (updateAttr st (insertPosParent parentInsertPos)) (insertPos', attrSt))
-
-             put (insertPos'', (elSt' :++ attrSt'))
-
-             pure parentInsertPos
+             pure (ConstructedSnippet elOut elAfter siblingPos childPos (elSt' :++ attrSt'))
 
         finish' =
           do (elemSt :++ attrSt) <- ask
@@ -1137,15 +1165,14 @@ captured_ :: forall internalState out state algebra parentAlgebra.
 captured_ modOut (Snippet createUnder updateElem finish) =
     Snippet createUnder' updateElem' finish
     where createUnder' :: RunAlgebra algebra -> state -> SnippetConstructor internalState out
-          createUnder' run st =
-              do res@(_, st') <- createUnder run st
-                 tell (Endo (modOut st'), mempty)
-                 pure res
-          updateElem' st =
-              do res <- updateElem st
-                 (_, st) <- get
-                 tell (Endo (modOut st), mempty)
-                 pure res
+          createUnder' run st pos =
+              do res <- createUnder run st pos
+                 pure res { constructedSnippetOut = constructedSnippetOut res <>
+                                                    Endo (modOut (constructedState res)) }
+          updateElem' st pos intSt =
+              do res <- updateElem st pos intSt
+                 pure res { constructedSnippetOut = constructedSnippetOut res <>
+                                                    Endo (modOut (constructedState res)) }
 
 someSnippet_ :: forall out state algebra parentAlgebra.
                 SomeSnippet out state algebra parentAlgebra
@@ -1154,16 +1181,16 @@ someSnippet_ (SomeSnippet (Snippet createUnder updateElem finish)) =
     Snippet createUnder' updateElem' finish'
   where
     createUnder' :: RunAlgebra algebra -> state -> SnippetConstructor (RenderedSnippet out state) out
-    createUnder' update st =
-        do (pos, intSt) <- createUnder update st
-           let snippet' = RenderedSnippet intSt updateElem finish
-           pure (pos, snippet')
+    createUnder' update st pos =
+        do ConstructedSnippet mkOut scheduled siblingPos childPos intSt <- createUnder update st pos
+           pure (ConstructedSnippet mkOut scheduled siblingPos childPos
+                                    (RenderedSnippet intSt updateElem finish))
 
-    updateElem' st =
-        do (siblingPos, RenderedSnippet intSt updateElem finish) <- get
-           (parentPos, (siblingPos', intSt')) <- lift (runStateT (updateElem st) (siblingPos, intSt))
-           put (siblingPos', RenderedSnippet intSt' updateElem finish)
-           pure parentPos
+    updateElem' st siblingPos (RenderedSnippet intSt updateElem finish) =
+        do ConstructedSnippet mkOut scheduled siblingPos' childPos intSt' <-
+               updateElem st siblingPos intSt
+           pure (ConstructedSnippet mkOut scheduled siblingPos' childPos
+                                    (RenderedSnippet intSt' updateElem finish))
 
     finish' :: ReaderT (RenderedSnippet out state) IO ()
     finish' = do RenderedSnippet intSt _ finish <- ask
@@ -1175,7 +1202,7 @@ mount_ :: forall childAlgebra out st algebra parentAlgebra.
        -> Snippet (MountedComponent childAlgebra algebra) out st algebra parentAlgebra
 mount_ setChild mkComponent = Snippet createUnder updateElem finish
     where createUnder :: RunAlgebra algebra -> st -> SnippetConstructor (MountedComponent childAlgebra algebra) out
-          createUnder update st =
+          createUnder update st siblingPos =
             case mkComponent st of
               Component { componentTemplate = componentTemplate@(Snippet { .. })
                         , .. } -> do
@@ -1187,24 +1214,32 @@ mount_ setChild mkComponent = Snippet createUnder updateElem finish
                  redrawStateVar <- liftIO (newMVar Nothing)
                  Just window <- liftIO currentWindow
 
-                 let redraw _ = do scheduled <- bracket (takeMVar doneVar) (putMVar doneVar) $ \isDone ->
+                 let redraw _ = do --putStrLn "redraw"
+                                   scheduled <- bracket (takeMVar doneVar) (putMVar doneVar) $ \isDone ->
                                                 if not isDone then
-                                                    do modifyMVar_ redrawStateVar $ \_ -> pure Nothing
+                                                    do --putStrLn "redraw after isDone 1"
+                                                       modifyMVar_ redrawStateVar $ \_ -> pure Nothing
 
                                                        (st, intSt) <- takeMVar stVar
                                                        (insPos, _, childPos) <- takeMVar siblingVar
-                                                       ((childPos, (insPos', !intSt')), (Endo mkOut, scheduled)) <-
-                                                           runWriterT (runStateT (snippetUpdateElem st) (insPos, intSt))
+                                                       ConstructedSnippet (Endo mkOut) scheduled insPos' childPos !intSt' <-
+                                                           snippetUpdateElem st insPos intSt
 
-                                                       putMVar stVar (st, intSt')
                                                        putMVar siblingVar (insPos, insPos', childPos)
+                                                       putMVar stVar (st, intSt')
                                                        modifyMVar_ outVar $ \_ -> pure (mkOut componentEmptyOut)
                                                        out' <- readMVar outVar
+--                                                       putStrLn "redraw after isDone 3"
                                                        pure (runAfterAction scheduled out')
-                                                  else pure (pure ())
+                                                  else do
+--                                                    putStrLn "redraw after isDone 2"
+                                                    modifyMVar_ redrawStateVar $ \_ -> pure Nothing
+                                                    pure (pure ())
+--                                   putStrLn "redraw after run scheduled"
                                    scheduled
+--                                   putStrLn "done redraw"
 
-                 redrawCallback <- newRequestAnimationFrameCallback redraw
+--                 redrawCallback <- newRequestAnimationFrameCallback redraw
 
                  let intSt = MountedComponent stVar outVar siblingVar
                                               componentEmptyOut (EmbeddedAlgebraWrapper runAlgebra'') finish
@@ -1214,21 +1249,24 @@ mount_ setChild mkComponent = Snippet createUnder updateElem finish
                                  putMVar doneVar True
 
                                  when (not isDone) $
-                                   do redrawState <- readMVar redrawStateVar
-                                      case redrawState of
-                                        Nothing -> pure ()
-                                        Just id -> cancelAnimationFrame window id
+                                   do --redrawState <- readMVar redrawStateVar
+                                      -- case redrawState of
+                                      --   Nothing -> pure ()
+                                      --   Just id -> cancelAnimationFrame window id
 
-                                      let RequestAnimationFrameCallback cb = redrawCallback
-                                      releaseCallback cb
+                                      -- let RequestAnimationFrameCallback cb = redrawCallback
+                                      -- releaseCallback cb
 
                                       (st, intSt) <- readMVar stVar
                                       runReaderT snippetFinish intSt
 
                      runAlgebra'' :: forall a. childAlgebra a -> algebra a
-                     runAlgebra'' a = do (st, intSt) <- liftIO (takeMVar stVar)
-                                         out <- liftIO (readMVar outVar)
+                     runAlgebra'' a = do --liftIO $ putStrLn "runAlgebra''"
                                          isDone <- liftIO (readMVar doneVar)
+--                                         liftIO (putStrLn ("run algebra'': " <> show isDone))
+                                         (st, intSt) <- liftIO (takeMVar stVar)
+                                         --liftIO $ putStrLn "Got state"
+                                         out <- liftIO (readMVar outVar)
                                          oldStNm <- liftIO (makeStableName st)
                                          (x, !st') <- componentRunAlgebra (EnterExit (\(!st) -> liftIO (putMVar stVar (st, intSt))) (liftIO (fst <$> takeMVar stVar))) st out a
                                          newStNm <- liftIO (makeStableName st')
@@ -1239,41 +1277,34 @@ mount_ setChild mkComponent = Snippet createUnder updateElem finish
                                               (liftIO . modifyMVar_ redrawStateVar $ \redrawState ->
                                                    case redrawState of
                                                      Nothing ->
-                                                         do id <- requestAnimationFrame window (Just redrawCallback)
+                                                         do id <- requestAnimationFrameHs redraw -- window (Just redrawCallback)
                                                             pure (Just id)
                                                      Just id -> pure (Just id))
 
                                          pure x
 
                      runAlgebra' :: forall a. childAlgebra a -> IO a
-                     runAlgebra' = update . runAlgebra''
+                     runAlgebra' a = update (runAlgebra'' a)
 
-                 siblingPos <- get
+                 ConstructedSnippet (Endo mkOut) scheduled siblingPos' childPos compIntSt <-
+                     snippetCreateUnder runAlgebra' componentStateInitial siblingPos
+        --             lift (lift (runWriterT (runStateT (snippetCreateUnder runAlgebra' componentStateInitial) siblingPos)))
 
-                 (((childPos, compIntSt), siblingPos'), (Endo mkOut, scheduled)) <-
-                     lift (lift (runWriterT (runStateT (snippetCreateUnder runAlgebra' componentStateInitial) siblingPos)))
-                 put siblingPos'
+                 putMVar stVar (componentStateInitial, compIntSt)
+                 putMVar outVar (mkOut componentEmptyOut)
+                 putMVar siblingVar (siblingPos, siblingPos', childPos)
+                 out' <- readMVar outVar
 
-                 out' <- liftIO $ do
-                   putMVar stVar (componentStateInitial, compIntSt)
-                   putMVar outVar (mkOut componentEmptyOut)
-                   putMVar siblingVar (siblingPos, siblingPos', childPos)
-                   readMVar outVar
+                 pure (ConstructedSnippet (Endo (setChild st (EmbeddedAlgebraWrapper runAlgebra'')))
+                                          (AfterAction [ \_ -> runAfterAction scheduled out'
+                                                       , \_ -> runAlgebra' (componentOnConstruct runAlgebra') ])
+                                          siblingPos' childPos intSt)
 
-                 tell ( Endo (setChild st (EmbeddedAlgebraWrapper runAlgebra''))
-                      , AfterAction [ \_ -> runAlgebra' (componentOnConstruct runAlgebra')
-                                    , \_ -> runAfterAction scheduled out' ] )
+          updateElem st insPos mc@MountedComponent { .. } =
+              do (_, insPos', childPos) <- liftIO (readMVar mountedInsPosV)
 
-                 pure (childPos, intSt)
-
-          updateElem st =
-              do (insPos, mc@MountedComponent { .. }) <- get
-                 (_, insPos', childPos) <- liftIO (readMVar mountedInsPosV)
-                 put (insPos', mc)
-
-                 tell (Endo (setChild st mountedAlgebraWrapper), mempty)
-
-                 pure childPos
+                 pure (ConstructedSnippet (Endo (setChild st mountedAlgebraWrapper))
+                                          mempty insPos' childPos mc)
 
           finish =
               do MountedComponent { .. } <- ask
@@ -1295,7 +1326,8 @@ emptyComp :: MonadIO parentAlgebra => Component parentAlgebra parentAlgebra
 emptyComp = comp () () (\_ st _ a -> do { x <- a; return (x, st); }) (\_ -> return ()) (span_)  -- TODO this can probably be an empty element
 
 emptySnippet :: Snippet () out state algebra parentAlgebra
-emptySnippet = Snippet (\_ _ -> (, ()) <$> get) (\_ -> fst <$> get) (return ())
+emptySnippet = Snippet (\_ _ pos -> pure (ConstructedSnippet mempty mempty pos pos ()))
+                       (\_ pos () -> pure (ConstructedSnippet mempty mempty pos pos ())) (return ())
 
 mountComponent :: Element -> Component algebra IO -> IO ()
 mountComponent el (Component st emptyOut runAlgebra onCreate (Snippet createTemplate updateTemplate finishTemplate :: Snippet intSt st out algebra IO))  =
@@ -1306,44 +1338,56 @@ mountComponent el (Component st emptyOut runAlgebra onCreate (Snippet createTemp
      Just window <- currentWindow
 
      redrawStateVar <- newMVar Nothing
-     let redraw _ = do modifyMVar_ redrawStateVar $ \_ -> pure Nothing
+     let redraw _ = do --putStrLn "redraw mountcomponent"
+                       modifyMVar_ redrawStateVar $ \_ -> pure Nothing
                        (st, intSt) <- takeMVar stVar
-                       ((_, (_, intSt')), (Endo mkOut, scheduled)) <- runWriterT (runStateT (updateTemplate st) (DOMInsertPos (toNode el) Nothing, intSt))
+                       --putStrLn "redraw mountcomponent 1"
+                       ConstructedSnippet (Endo mkOut) scheduled _ _ intSt' <-
+                           updateTemplate st (DOMInsertPos (toNode el) Nothing) intSt
+                       --putStrLn "redraw mountcomponent 2"
                        putMVar stVar (st, intSt')
+                       --putStrLn "redraw mountcomponent 3"
                        modifyMVar_ outVar $ \_ -> pure (mkOut emptyOut)
                        out' <- readMVar outVar
+                       --putStrLn "Running mountcomponent afteraction"
                        runAfterAction scheduled out'
+                       --putStrLn "Done redraw"
 
-     redrawCallback <- newRequestAnimationFrameCallback redraw
+--     redrawCallback <- newRequestAnimationFrameCallback redraw
 
      let runAlgebra' :: forall a. algebra a -> IO a
-         runAlgebra' a = bracket (takeMVar syncVar) (putMVar syncVar) $ \_ ->
-                         do (x, shouldRedraw) <- modifyMVar stVar $ \(st, intSt) ->
-                                 do out <- readMVar outVar
-                                    oldStNm <- makeStableName st
-                                    (x, !st') <- runAlgebra (EnterExit (\st -> putMVar stVar (st, intSt)) (fst <$> takeMVar stVar)) st out a
-                                    newStNm <- makeStableName st'
-                                    pure ((st', intSt), (x, oldStNm /= newStNm))
+         runAlgebra' a = do
+--           putStrLn "Run algebra mount component"
+           bracket (takeMVar syncVar) (putMVar syncVar) $ \_ ->
+             do (x, shouldRedraw) <- modifyMVar stVar $ \(st, intSt) ->
+                     do out <- readMVar outVar
+                        oldStNm <- makeStableName st
+                        (x, !st') <- runAlgebra (EnterExit (\st -> putMVar stVar (st, intSt)) (fst <$> takeMVar stVar)) st out a
+                        newStNm <- makeStableName st'
+                        pure ((st', intSt), (x, oldStNm /= newStNm))
 
-                            when shouldRedraw scheduleRedraw
+--                putStrLn ("Mount component should redraw: " <> show shouldRedraw)
+                when shouldRedraw scheduleRedraw
 
-                            pure x
+                pure x
          scheduleRedraw = do
            redrawState <- takeMVar redrawStateVar
            case redrawState of
              Nothing ->
-                 do id <- requestAnimationFrame window (Just redrawCallback)
+                 do id <- requestAnimationFrameHs redraw -- window (Just redrawCallback)
                     putMVar redrawStateVar (Just id)
              Just _ -> putMVar redrawStateVar redrawState
 
-     (((_, intSt), _), (Endo mkOut, scheduled)) <- runWriterT (runStateT (createTemplate runAlgebra' st) (DOMInsertPos (toNode el) Nothing))
+     ConstructedSnippet (Endo mkOut) scheduled _ _ intSt <-
+         createTemplate runAlgebra' st (DOMInsertPos (toNode el) Nothing)
 
      putMVar stVar (st, intSt)
      putMVar outVar (mkOut emptyOut)
 
-     runAlgebra' (onCreate runAlgebra')
      out' <- readMVar outVar
+
      runAfterAction scheduled out'
+     runAlgebra' (onCreate runAlgebra')
 
      pure ()
 
