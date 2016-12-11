@@ -41,10 +41,10 @@ import Data.JSString.Text
 import Data.String (fromString)
 
 import GHCJS.DOM
-import GHCJS.DOM.Element hiding (drop)
+import GHCJS.DOM.Element hiding (drop, error)
 import GHCJS.DOM.Node
 import GHCJS.DOM.Text
-import GHCJS.DOM.Document hiding (drop, evaluate)
+import GHCJS.DOM.Document hiding (drop, evaluate, error)
 import GHCJS.DOM.Types
 import GHCJS.DOM.EventTarget
 import GHCJS.DOM.HTMLInputElement
@@ -52,7 +52,7 @@ import GHCJS.DOM.EventTargetClosures
 import GHCJS.DOM.EventM
 import GHCJS.DOM.Event
 import GHCJS.DOM.NodeList (getLength, item)
-import GHCJS.DOM.Window hiding (drop, getLength)
+import GHCJS.DOM.Window hiding (drop, getLength, error)
 import GHCJS.DOM.RequestAnimationFrameCallback
 import qualified GHCJS.DOM.DOMTokenList as TokenList
 import GHCJS.DOM.CSSStyleDeclaration hiding (getLength, item)
@@ -117,8 +117,9 @@ data Component (algebra :: * -> *) (parentAlgebra :: * -> *) where
 
 data MountedComponent algebra parentAlgebra where
     MountedComponent :: MonadIO parentAlgebra =>
-                        { mountedStateV   :: MVar (state, internalState)
-                        , mountedOutV     :: MVar out
+                        { mountedStateV   :: MVar state
+                        , mountedIntStateV :: IORef internalSt
+                        , mountedOutV     :: IORef out
                         , mountedInsPosV  :: MVar (DOMInsertPos, DOMInsertPos, DOMInsertPos)
                         , mountedEmptyOut :: out
                         , mountedAlgebraWrapper :: EmbeddedAlgebraWrapper algebra parentAlgebra
@@ -153,6 +154,9 @@ runAfterAction act out = go' act out
     where go' (AfterAction []) out = pure ()
           go' (AfterAction (x:xs)) out = x out >> go' (AfterAction xs) out
 
+class RawIO m where
+    rawIO :: IO a -> m a
+
 foreign import javascript unsafe "console.log($1, $2, $3);" js_log :: Node -> Node -> Node -> IO ()
 foreign import javascript unsafe "console.log($1, $2);" js_log2 :: Node -> Node -> IO ()
 foreign import javascript unsafe "console.log($1);" js_log1 :: Node -> IO ()
@@ -167,7 +171,7 @@ _animFrameCallbackVar =
 
 requestAnimationFrameHs :: (Double -> IO ()) -> IO ()
 requestAnimationFrameHs doDraw = do
---  putStrLn "request animation frame"
+  putStrLn "request animation frame"
   modifyMVar_ _animFrameCallbackVar $ \(cb, existing, reqs) ->
     do let reqs' = doDraw:reqs
 
@@ -192,8 +196,8 @@ requestAnimationFrameHs doDraw = do
                    if null reqs
                       then pure ((cb, Nothing, mempty), mempty)
                       else pure ((cb, existing, mempty), reqs)
---           putStrLn ("Have " <> show (length reqs) <> " to go")
-           if null reqs then {- putStrLn "Done drawing" >> -} pure ()
+           putStrLn ("Have " <> show (length reqs) <> " to go")
+           if null reqs then putStrLn "Done drawing" >> pure ()
               else do
                 forM_ reqs $ \req ->
                   req ts
@@ -1197,7 +1201,7 @@ someSnippet_ (SomeSnippet (Snippet createUnder updateElem finish)) =
                  lift (runReaderT finish intSt)
 
 mount_ :: forall childAlgebra out st algebra parentAlgebra.
-          MonadIO algebra =>
+          (MonadIO algebra, RawIO algebra) =>
           (st -> EmbeddedAlgebraWrapper childAlgebra algebra -> out -> out) -> (st -> Component childAlgebra algebra)
        -> Snippet (MountedComponent childAlgebra algebra) out st algebra parentAlgebra
 mount_ setChild mkComponent = Snippet createUnder updateElem finish
@@ -1207,47 +1211,48 @@ mount_ setChild mkComponent = Snippet createUnder updateElem finish
               Component { componentTemplate = componentTemplate@(Snippet { .. })
                         , .. } -> do
                  stVar  <- liftIO newEmptyMVar
-                 outVar <- liftIO newEmptyMVar
-                 doneVar <- liftIO (newMVar False)
+                 outVar <- liftIO (newIORef (error "outVar not set"))
+                 intStVar <- liftIO (newIORef (error "intStVar not set"))
+                 doneVar <- liftIO (newIORef False)
                  siblingVar <- liftIO newEmptyMVar
 
-                 redrawStateVar <- liftIO (newMVar Nothing)
+                 isDirtyV <- liftIO (newIORef False)
                  Just window <- liftIO currentWindow
 
-                 let redraw _ = do --putStrLn "redraw"
-                                   scheduled <- bracket (takeMVar doneVar) (putMVar doneVar) $ \isDone ->
-                                                if not isDone then
+                 let redraw _ = do putStrLn "redraw mount_"
+                                   isDone <- readIORef doneVar
+                                   scheduled <- if not isDone then
                                                     do --putStrLn "redraw after isDone 1"
-                                                       modifyMVar_ redrawStateVar $ \_ -> pure Nothing
+                                                       atomicWriteIORef isDirtyV False
 
-                                                       (st, intSt) <- takeMVar stVar
+                                                       (st, intSt) <- bracket (takeMVar stVar) (putMVar stVar) $ \st ->
+                                                                      (st,) <$> readIORef intStVar
                                                        (insPos, _, childPos) <- takeMVar siblingVar
                                                        ConstructedSnippet (Endo mkOut) scheduled insPos' childPos !intSt' <-
                                                            snippetUpdateElem st insPos intSt
 
+                                                       atomicWriteIORef intStVar intSt'
                                                        putMVar siblingVar (insPos, insPos', childPos)
-                                                       putMVar stVar (st, intSt')
-                                                       modifyMVar_ outVar $ \_ -> pure (mkOut componentEmptyOut)
-                                                       out' <- readMVar outVar
+
+                                                       let !out = mkOut componentEmptyOut
+                                                       atomicWriteIORef outVar out
 --                                                       putStrLn "redraw after isDone 3"
-                                                       pure (runAfterAction scheduled out')
+                                                       pure (runAfterAction scheduled out)
                                                   else do
 --                                                    putStrLn "redraw after isDone 2"
-                                                    modifyMVar_ redrawStateVar $ \_ -> pure Nothing
+                                                    atomicWriteIORef isDirtyV False
                                                     pure (pure ())
---                                   putStrLn "redraw after run scheduled"
+                                   putStrLn "redraw after run scheduled"
                                    scheduled
---                                   putStrLn "done redraw"
+                                   putStrLn "done redraw"
 
 --                 redrawCallback <- newRequestAnimationFrameCallback redraw
 
-                 let intSt = MountedComponent stVar outVar siblingVar
+                 let intSt = MountedComponent stVar intStVar outVar siblingVar
                                               componentEmptyOut (EmbeddedAlgebraWrapper runAlgebra'') finish
                                               componentRunAlgebra componentTemplate
 
-                     finish = do isDone <- takeMVar doneVar
-                                 putMVar doneVar True
-
+                     finish = do isDone <- atomicModifyIORef doneVar (\isDone -> (True, isDone))
                                  when (not isDone) $
                                    do --redrawState <- readMVar redrawStateVar
                                       -- case redrawState of
@@ -1257,30 +1262,30 @@ mount_ setChild mkComponent = Snippet createUnder updateElem finish
                                       -- let RequestAnimationFrameCallback cb = redrawCallback
                                       -- releaseCallback cb
 
-                                      (st, intSt) <- readMVar stVar
+                                      (st, intSt) <- bracket (takeMVar stVar) (putMVar stVar) $ \st ->
+                                                     (st,) <$> readIORef intStVar
                                       runReaderT snippetFinish intSt
 
                      runAlgebra'' :: forall a. childAlgebra a -> algebra a
                      runAlgebra'' a = do --liftIO $ putStrLn "runAlgebra''"
-                                         isDone <- liftIO (readMVar doneVar)
---                                         liftIO (putStrLn ("run algebra'': " <> show isDone))
-                                         (st, intSt) <- liftIO (takeMVar stVar)
+                                         (isDone, st, intSt, out, oldStNm) <-
+                                             rawIO $
+                                             do isDone <- readIORef doneVar
+                                                st <- takeMVar stVar
+                                                (isDone,st,,,) <$> readIORef intStVar <*> readIORef outVar <*> makeStableName st
+
                                          --liftIO $ putStrLn "Got state"
-                                         out <- liftIO (readMVar outVar)
-                                         oldStNm <- liftIO (makeStableName st)
-                                         (x, !st') <- componentRunAlgebra (EnterExit (\(!st) -> liftIO (putMVar stVar (st, intSt))) (liftIO (fst <$> takeMVar stVar))) st out a
-                                         newStNm <- liftIO (makeStableName st')
+                                         (x, !st') <- componentRunAlgebra (EnterExit (\(!st) -> rawIO (putMVar stVar st)) (rawIO (takeMVar stVar))) st out a
 
-                                         liftIO $ if isDone then putMVar stVar (st, intSt) else putMVar stVar (st', intSt)
+                                         rawIO $
+                                           if isDone
+                                           then putMVar stVar st
+                                           else do putMVar stVar st'
 
-                                         when (oldStNm /= newStNm && not isDone)
-                                              (liftIO . modifyMVar_ redrawStateVar $ \redrawState ->
-                                                   case redrawState of
-                                                     Nothing ->
-                                                         do id <- requestAnimationFrameHs redraw -- window (Just redrawCallback)
-                                                            pure (Just id)
-                                                     Just id -> pure (Just id))
-
+                                                   newStNm <- makeStableName st'
+                                                   when (oldStNm /= newStNm) $ do
+                                                     wasDirty <- atomicModifyIORef isDirtyV (\isDirty -> (True, isDirty))
+                                                     when (not wasDirty) (requestAnimationFrameHs redraw)
                                          pure x
 
                      runAlgebra' :: forall a. childAlgebra a -> IO a
@@ -1290,14 +1295,17 @@ mount_ setChild mkComponent = Snippet createUnder updateElem finish
                      snippetCreateUnder runAlgebra' componentStateInitial siblingPos
         --             lift (lift (runWriterT (runStateT (snippetCreateUnder runAlgebra' componentStateInitial) siblingPos)))
 
-                 putMVar stVar (componentStateInitial, compIntSt)
-                 putMVar outVar (mkOut componentEmptyOut)
+                 atomicWriteIORef intStVar compIntSt
+
+                 let !initialOut = mkOut componentEmptyOut
+                 atomicWriteIORef outVar initialOut
+
+                 putMVar stVar componentStateInitial
                  putMVar siblingVar (siblingPos, siblingPos', childPos)
-                 out' <- readMVar outVar
 
                  pure (ConstructedSnippet (Endo (setChild st (EmbeddedAlgebraWrapper runAlgebra'')))
-                                          (AfterAction [ \_ -> runAfterAction scheduled out'
-                                                       , \_ -> runAlgebra' (componentOnConstruct runAlgebra') ])
+                                          (AfterAction [ \_ -> runAlgebra' (componentOnConstruct runAlgebra')
+                                                       , \_ -> runAfterAction scheduled initialOut ])
                                           siblingPos' childPos intSt)
 
           updateElem st insPos mc@MountedComponent { .. } =
@@ -1332,62 +1340,67 @@ emptySnippet = Snippet (\_ _ pos -> pure (ConstructedSnippet mempty mempty pos p
 mountComponent :: Element -> Component algebra IO -> IO ()
 mountComponent el (Component st emptyOut runAlgebra onCreate (Snippet createTemplate updateTemplate finishTemplate :: Snippet intSt st out algebra IO))  =
   do stVar <- newEmptyMVar
-     outVar <- newEmptyMVar
+     intStVar <- newIORef (error "intStVar not set")
+     outVar <- newIORef (error "outVar not set")
      syncVar <- newMVar ()
 
      Just window <- currentWindow
 
-     redrawStateVar <- newMVar Nothing
-     let redraw _ = do --putStrLn "redraw mountcomponent"
-                       modifyMVar_ redrawStateVar $ \_ -> pure Nothing
-                       (st, intSt) <- takeMVar stVar
+     isDirtyV <- newIORef False
+     let redraw _ = do putStrLn "redraw mountcomponent"
+                       atomicWriteIORef isDirtyV False
+                       (st, intSt) <- bracket (takeMVar stVar) (putMVar stVar) $ \st ->
+                                      (st,) <$> readIORef intStVar
+--                       (st, intSt) <- takeMVar stVar
                        --putStrLn "redraw mountcomponent 1"
                        ConstructedSnippet (Endo mkOut) scheduled _ _ intSt' <-
                            updateTemplate st (DOMInsertPos (toNode el) Nothing) intSt
                        --putStrLn "redraw mountcomponent 2"
-                       putMVar stVar (st, intSt')
+                       atomicWriteIORef intStVar intSt'
+--                       putMVar stVar (st, intSt')
                        --putStrLn "redraw mountcomponent 3"
-                       modifyMVar_ outVar $ \_ -> pure (mkOut emptyOut)
-                       out' <- readMVar outVar
-                       --putStrLn "Running mountcomponent afteraction"
+                       let out' = mkOut emptyOut
+                       atomicWriteIORef outVar out'
+                       putStrLn "Running mountcomponent afteraction"
                        runAfterAction scheduled out'
-                       --putStrLn "Done redraw"
+                       putStrLn "Done redraw"
 
 --     redrawCallback <- newRequestAnimationFrameCallback redraw
 
      let runAlgebra' :: forall a. algebra a -> IO a
-         runAlgebra' a = do
+         runAlgebra' a =
 --           putStrLn "Run algebra mount component"
-           bracket (takeMVar syncVar) (putMVar syncVar) $ \_ ->
-             do (x, shouldRedraw) <- modifyMVar stVar $ \(st, intSt) ->
-                     do out <- readMVar outVar
+--           bracket (takeMVar syncVar) (putMVar syncVar) $ \_ ->
+             do (x, shouldRedraw) <- modifyMVar stVar $ \st ->
+                     do out <- readIORef outVar
+                        intSt <- readIORef intStVar
                         oldStNm <- makeStableName st
-                        (x, !st') <- runAlgebra (EnterExit (\st -> putMVar stVar (st, intSt)) (fst <$> takeMVar stVar)) st out a
+                        (x, !st') <- runAlgebra (EnterExit (putMVar stVar) (takeMVar stVar)) st out a
                         newStNm <- makeStableName st'
-                        pure ((st', intSt), (x, oldStNm /= newStNm))
+                        pure (st', (x, oldStNm /= newStNm))
 
 --                putStrLn ("Mount component should redraw: " <> show shouldRedraw)
                 when shouldRedraw scheduleRedraw
 
                 pure x
          scheduleRedraw = do
-           redrawState <- takeMVar redrawStateVar
-           case redrawState of
-             Nothing ->
-                 do id <- requestAnimationFrameHs redraw -- window (Just redrawCallback)
-                    putMVar redrawStateVar (Just id)
-             Just _ -> putMVar redrawStateVar redrawState
+           wasDirty <- atomicModifyIORef isDirtyV (\isDirty -> (True, isDirty))
+           when (not wasDirty) (requestAnimationFrameHs redraw)
 
      ConstructedSnippet (Endo mkOut) scheduled _ _ intSt <-
          createTemplate runAlgebra' st (DOMInsertPos (toNode el) Nothing)
 
-     putMVar stVar (st, intSt)
-     putMVar outVar (mkOut emptyOut)
+     atomicWriteIORef intStVar intSt
 
-     out' <- readMVar outVar
+     let !initialOut = mkOut emptyOut
+     atomicWriteIORef outVar initialOut
 
-     runAfterAction scheduled out'
+     putMVar stVar st
+
+     putStrLn "Start create actions"
      runAlgebra' (onCreate runAlgebra')
+     runAfterAction scheduled initialOut
+     putStrLn "Done create action"
 
      pure ()
 
@@ -1477,6 +1490,9 @@ instance Monad m => Monad (EnterExitT state out m) where
     return x = EnterExitT $ \_ _ st -> return (x, st)
 instance MonadIO m => MonadIO (EnterExitT state out m) where
     liftIO f = parentComponent (liftIO f)
+instance (RawIO m, Applicative m) => RawIO (EnterExitT state out m) where
+    rawIO f = EnterExitT $ \ee out st ->
+              fmap (,st) (rawIO f)
 instance Monad m => MonadReader out (EnterExitT state out m) where
     local f act =
         EnterExitT $ \ee out st ->
@@ -1486,6 +1502,13 @@ instance Monad m => MonadState state (EnterExitT state out m) where
     state f =
         EnterExitT $ \ee out st ->
             pure (f st)
+
+instance RawIO IO where
+    rawIO = id
+instance (RawIO m, Monad m) => RawIO (ReaderT r m) where
+    rawIO = lift . rawIO
+instance (RawIO m, Monad m) => RawIO (StateT s m) where
+    rawIO = lift . rawIO
 
 parentComponent :: MonadIO m => m a -> EnterExitT state out m a
 parentComponent action =
