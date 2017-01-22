@@ -2,31 +2,41 @@
 -- documentation, see http://haskell.org/cabal/users-guide/
 
 name:                tightrope
-version:             0.1.0.0
+version:             0.2.0.0
 -- synopsis:            
 -- description:         
 license:             MIT
 license-file:        LICENSE
 author:              Travis Athougies
 maintainer:          travis@athougies.net
--- copyright:           
+copyright:           Copyright (c) 2016 Travis Athougies
 category:            Web
 build-type:          Simple
--- extra-source-files:  
 cabal-version:       >=1.10
 
 library
-  exposed-modules:     Web.Tightrope
-  -- other-modules:       
+  exposed-modules:     Web.Tightrope Web.Tightrope.Types Web.Tightrope.Combinators
+                       Web.Tightrope.Component Web.Tightrope.Lifecycle Web.Tightrope.Event
+                       Web.Tightrope.Static Web.Tightrope.Generic
+                       Web.Tightrope.HTML Web.Tightrope.HTML.Attributes
+                       Web.Tightrope.Attributes Web.Tightrope.Element
+  if impl(ghcjs)
+    exposed-modules:   Web.Tightrope.JS
   other-extensions:    GADTs
-  ghc-options:         -O2
-  build-depends:       base >=4.8 && <5.0, mtl >=2.2 && <2.3, ghcjs-base, ghcjs-dom, ghcjs-dom-jsffi, ghcjs-dom-jsffi-wrapper, text, unordered-containers, hashable
-  -- hs-source-dirs:      
+  ghc-options:         -O2 -funbox-strict-fields
+  build-depends:       base >=4.8 && <5.0, mtl >=2.2 && <2.3, text, unordered-containers, hashable, transformers, lens
+  if impl(ghcjs)
+    build-depends:     ghcjs-base, ghcjs-dom, ghcjs-dom-jsffi
   default-language:    Haskell2010
+  default-extensions:  RankNTypes, KindSignatures, TypeOperators, TypeFamilies, FlexibleContexts,
+                       GADTs, StandaloneDeriving, ScopedTypeVariables, BangPatterns, TupleSections
 
 executable todomvc
   main-is: TodoMVC.hs
   hs-source-dirs: TodoMVC
   other-extensions: GADTs
   default-language: Haskell2010
-  build-depends:    base >=4.8 && <5.0, mtl >=2.2 && <2.3, ghcjs-base, ghcjs-dom, ghcjs-dom-jsffi, ghcjs-dom-jsffi-wrapper, tightrope, vector
+  if impl(ghcjs)
+    build-depends:    base >=4.8 && <5.0, mtl >=2.2 && <2.3, ghcjs-base, ghcjs-dom, tightrope, vector
+  else
+    build-depends:     base >=4.8 && <5.0

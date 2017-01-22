@@ -2,9 +2,11 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE CPP #-}
 
 module Main where
 
+#ifdef __GHCJS__
 import Web.Tightrope
 
 import Control.Monad.State
@@ -12,10 +14,10 @@ import Control.Arrow
 
 import GHCJS.DOM
 import GHCJS.DOM.Document hiding (keyDown, click)
-import GHCJS.DOM.Element
+import GHCJS.DOM.Element hiding (keyDown, click)
 import GHCJS.DOM.EventM hiding (on)
 import GHCJS.DOM.HTMLInputElement
-import GHCJS.DOM.Types (KeyboardEvent, UIEvent, MouseEvent)
+import GHCJS.DOM.Types (KeyboardEvent, UIEvent, MouseEvent, uncheckedCastTo)
 
 import qualified Data.Vector as V
 import Data.Monoid
@@ -43,29 +45,29 @@ todoMvc = statefulComp (TodoItemList Nothing mempty) () (\_ -> pure ()) $
              |- (header_ |+ class_ ("todoapp" :: JSString)
                 |- (h1_ |- text "todos")
                 |- (input_ |+ class_ ("new-todo" :: JSString) |+ placeholder_ ("What needs to be done?" :: JSString) |+ autofocus_ True
-                           |+ on (keyDown :: EventName Element KeyboardEvent) onNewTodo))
+                           |+ on keyDown onNewTodo))
 
              |- (section_ |+ class_ ("main" :: JSString)
                 |- (input_ |+ class_ ("toggle-all" :: JSString) |+ type_ ("checkbox" :: JSString)
                            |+ checked_ (\todoList -> V.all todoItemComplete (todoListItems todoList))
-                           |+ on (click :: EventName Element MouseEvent) markAllComplete)
+                           |+ on click markAllComplete)
                 |- (label_ |+ for_ ("toggle-all" :: JSString)
                            |- text "Mark all as complete")
 
                 |- (ul_ |+ class_ ("todo-list" :: JSString)
                         |- repeat_ (V.toList . todoListItems)
-                           (li_ |+ class_ (\item -> if todoItemComplete (current item) then "completed" else "" :: JSString)
-                                |+ on (click :: EventName Element MouseEvent) startEdit
+                           (li_ |+ dynClass "completed" (todoItemComplete . current)
+                                |+ on click startEdit
                                 |- (div_ |+ class_ ("view" :: JSString)
                                    |- (input_ |+ class_ ("toggle" :: JSString) |+ type_ ("checkbox" :: JSString) |+ checked_ (todoItemComplete . current)
-                                              |+ on (click :: EventName Element MouseEvent) itemToggled)
+                                              |+ on click itemToggled)
                                    |- (label_ |- dyn (jss . fromString . todoItemName . current))
                                    |- (button_ |+ class_ ("destroy" :: JSString)
-                                               |+ on (click :: EventName Element MouseEvent) deleteItem))
+                                               |+ on click deleteItem))
                                 |- (input_ |+ class_ ("edit" :: JSString) |+ value_ (jss . fromString . todoItemName . current)))))
 
              |- (footer_ |+ class_ ("footer" :: JSString)
-                         |+ style_ "display" (\todoList -> if V.null (todoListItems todoList) then "none" else "block" :: JSString)
+                         |+ style "display" (\todoList -> if V.null (todoListItems todoList) then "none" else "block" :: JSString)
                 |- (span_ |+ class_ ("todo-count" :: JSString)
                    |- dyn (jss . fromString . show . V.length . incompleteItems . todoListItems)
                    |- dyn (\todoList -> if V.length (incompleteItems (todoListItems todoList)) == 1 then " item left" else " items left"))
@@ -75,9 +77,9 @@ todoMvc = statefulComp (TodoItemList Nothing mempty) () (\_ -> pure ()) $
                    |- (li_ |- (a_ |+ href_ ("#/active" :: JSString) |- text "Active"))
                    |- (li_ |- (a_ |+ href_ ("#/completed"  :: JSString) |- text "Completed")))
                 |- (button_ |+ class_ ("clear-completed" :: JSString)
-                            |+ style_ "display" (\todoList -> if V.any todoItemComplete (todoListItems todoList)
-                                                              then "block" else "none" :: JSString)
-                            |+ on (click :: EventName Element MouseEvent) clearCompleted
+                            |+ style "display" (\todoList -> if V.any todoItemComplete (todoListItems todoList)
+                                                             then "block" else "none" :: JSString)
+                            |+ on click clearCompleted
                             |- text "Clear completed")))
           |- (footer_ |+ class_ ("info" :: JSString)
 
@@ -90,8 +92,7 @@ todoMvc = statefulComp (TodoItemList Nothing mempty) () (\_ -> pure ()) $
           onNewTodo updateComponent _ =
               do kc <- uiKeyCode
                  Just tgt <- target
-                 Just val <- do tgt <- liftIO (castToHTMLInputElement tgt)
-                                getValue tgt
+                 Just val <- getValue (uncheckedCastTo HTMLInputElement tgt)
 
                  when (kc == 13) $
                    do liftIO (setValue tgt (Just "" :: Maybe JSString))
@@ -126,3 +127,9 @@ todoMvc = statefulComp (TodoItemList Nothing mempty) () (\_ -> pure ()) $
                                                                                            , todoListItems = uncurry mappend (second tailIfNecy (V.splitAt (index st) (todoListItems todoList))) }
           tailIfNecy x | V.null x = mempty
                        | otherwise = V.tail x
+#else
+
+main :: IO ()
+main = return ()
+
+#endif
