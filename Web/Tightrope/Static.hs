@@ -51,6 +51,7 @@ data StaticNode ref
 type IONode = StaticNode IORef
 type FrozenNode = StaticNode Identity
 deriving instance Eq IONode
+deriving instance Show FrozenNode
 
 -- * Specializations
 
@@ -176,6 +177,8 @@ prependChild parent child =
          Nothing -> pure ()
          Just firstChild -> writeIORef (nodePrev firstChild) (Just child)
 
+       writeIORef (nodeParent child) (Just parent)
+
 insertAfter :: IONode -> IONode -> IO ()
 insertAfter prev child =
     do next <- readIORef (nodeNext prev)
@@ -186,6 +189,8 @@ insertAfter prev child =
        case next of
          Nothing -> pure ()
          Just next -> writeIORef (nodePrev next) (Just child)
+
+       writeIORef (nodeParent child) =<< readIORef (nodeParent prev)
 
 -- * Backend-specific functions
 

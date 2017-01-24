@@ -13,7 +13,7 @@ module Web.Tightrope.JS
     , mountComponent
 
     , click, dblClick
-    , keyDown, keyUp
+    , keyDown, keyUp, keyPress
 
     , change
 
@@ -303,9 +303,10 @@ dblClick, click :: Event DOMImpl DOM.MouseEvent
 dblClick = Event "dblclick"
 click = Event "click"
 
-keyDown, keyUp :: Event DOMImpl DOM.KeyboardEvent
+keyDown, keyUp, keyPress :: Event DOMImpl DOM.KeyboardEvent
 keyDown = Event "keydown"
 keyUp = Event "keyup"
+keyPress = Event "keypress"
 
 mouseUp, mouseDown, mouseEnter, mouseLeave, mouseOver, mouseOut, mouseMove, contextMenu :: Event DOMImpl DOM.MouseEvent
 mouseUp = Event "mouseup"

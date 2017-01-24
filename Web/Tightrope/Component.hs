@@ -19,7 +19,8 @@ import System.Mem.StableName
 comp :: (MonadIO parentAlgebra, TightropeImpl impl) =>
         state -> out -> (forall a. EnterExit state out parentAlgebra algebra -> state -> out -> algebra a -> IO (a, state))
      -> (RunAlgebra algebra -> algebra ())
-     -> Snippet' impl internalState out state algebra parentAlgebra -> Component' impl algebra parentAlgebra
+     -> Snippet' impl internalState out state algebra parentAlgebra
+     -> Component' impl props algebra parentAlgebra
 comp = Component
 
 statefulComp :: (MonadIO parentAlgebra, TightropeImpl impl) =>
@@ -29,7 +30,7 @@ statefulComp :: (MonadIO parentAlgebra, TightropeImpl impl) =>
 statefulComp st out = comp st out (\enterExit st out a -> runEnterExitT a enterExit out st)
 
 emptyComp :: (MonadIO parentAlgebra, TightropeImpl impl) => Component' impl parentAlgebra parentAlgebra
-emptyComp = comp () () (\(EnterExit _ _ runParent _) st _ a -> do { x <- runParent a; return (x, st); }) (\_ -> return ()) (span_)  -- TODO this can probably be an empty element
+emptyComp = comp () () (\(EnterExit _ _ runParent _) st _ a -> do { x <- runParent a; return (x, st); }) (\_ -> return ()) emptySnippet
 
 -- * Mounting support
 

@@ -124,14 +124,15 @@ data Attribute' impl attrSt state algebra (parentAlgebra :: * -> *)
     , attributeUpdate :: RunAlgebra algebra -> state -> Node impl -> attrSt -> IO attrSt
     , attributeFinish :: attrSt -> IO () }
 
-data Component' impl (algebra :: * -> *) (parentAlgebra :: * -> *) where
+data Component' impl props (algebra :: * -> *) (parentAlgebra :: * -> *) where
     Component :: MonadIO parentAlgebra =>
                  { componentStateInitial :: state
                  , componentEmptyOut     :: out
                  , componentRunAlgebra   :: forall a. EnterExit state out parentAlgebra algebra -> state -> out -> algebra a -> IO (a, state)
                  , componentOnConstruct  :: RunAlgebra algebra -> algebra ()
+                 , componentOnPropsUpdate :: props -> algebra ()
                  , componentTemplate     :: Snippet' impl internalSt out state algebra parentAlgebra }
-              -> Component' impl algebra parentAlgebra
+              -> Component' impl props algebra parentAlgebra
 
 data MountedComponent impl algebra parentAlgebra where
     MountedComponent :: MonadIO parentAlgebra =>
