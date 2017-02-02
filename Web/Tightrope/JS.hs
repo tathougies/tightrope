@@ -238,8 +238,8 @@ requestAnimationFrameHs doDraw = do
                   req ts
                 _doRedraw ts
 
-mountComponent :: DOM.Element -> Component algebra IO -> IO ()
-mountComponent el (Component st emptyOut runAlgebra onCreate (Snippet createTemplate updateTemplate finishTemplate :: Snippet intSt st out algebra IO))  =
+mountComponent :: DOM.Element -> props -> Component props algebra IO -> IO (props -> IO ())
+mountComponent el initialProps (Component mkSt emptyOut runAlgebra onCreate onPropsChange (Snippet createTemplate updateTemplate finishTemplate :: Snippet intSt st out algebra IO))  =
   do stVar <- newEmptyMVar
      intStVar <- newIORef (error "intStVar not set")
      outVar <- newIORef (error "outVar not set")
@@ -282,10 +282,11 @@ mountComponent el (Component st emptyOut runAlgebra onCreate (Snippet createTemp
            when (not wasDirty) (requestAnimationFrameHs redraw)
 
          getSt = readMVar stVar
+         initialState = mkSt initialProps
 
-     putMVar stVar st
+     putMVar stVar initialState
      ConstructedSnippet (Endo mkOut) scheduled _ _ intSt <-
-         createTemplate runAlgebra' st getSt (DOMInsertPos (DOM.toNode el) Nothing)
+         createTemplate runAlgebra' initialState getSt (DOMInsertPos (DOM.toNode el) Nothing)
 
      atomicWriteIORef intStVar intSt
 
@@ -293,9 +294,9 @@ mountComponent el (Component st emptyOut runAlgebra onCreate (Snippet createTemp
      atomicWriteIORef outVar initialOut
 
      runAfterAction scheduled initialOut
-     runAlgebra' (onCreate runAlgebra')
+     runAlgebra' (onCreate runAlgebra' initialProps)
 
-     pure ()
+     pure (\newProps -> runAlgebra' (onPropsChange newProps))
 
 -- * Events
 

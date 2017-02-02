@@ -17,33 +17,44 @@ import Data.Proxy
 import System.Mem.StableName
 
 comp :: (MonadIO parentAlgebra, TightropeImpl impl) =>
-        state -> out -> (forall a. EnterExit state out parentAlgebra algebra -> state -> out -> algebra a -> IO (a, state))
-     -> (RunAlgebra algebra -> algebra ())
+        (props -> state) -> out
+     -> (forall a. EnterExit state out parentAlgebra algebra -> state -> out -> algebra a -> IO (a, state))
+     -> (RunAlgebra algebra -> props -> algebra ())
+     -> (props -> algebra ())
      -> Snippet' impl internalState out state algebra parentAlgebra
      -> Component' impl props algebra parentAlgebra
 comp = Component
 
 statefulComp :: (MonadIO parentAlgebra, TightropeImpl impl) =>
-                state -> out -> (RunAlgebra (EnterExitT state out parentAlgebra) -> EnterExitT state out parentAlgebra ())
+                (props -> state) -> out
+             -> (RunAlgebra (EnterExitT state out parentAlgebra) -> props -> EnterExitT state out parentAlgebra ())
+             -> (props -> EnterExitT state out parentAlgebra ())
              -> Snippet' impl internalState out state (EnterExitT state out parentAlgebra) parentAlgebra
-             -> Component' impl (EnterExitT state out parentAlgebra) parentAlgebra
+             -> Component' impl props (EnterExitT state out parentAlgebra) parentAlgebra
 statefulComp st out = comp st out (\enterExit st out a -> runEnterExitT a enterExit out st)
 
-emptyComp :: (MonadIO parentAlgebra, TightropeImpl impl) => Component' impl parentAlgebra parentAlgebra
-emptyComp = comp () () (\(EnterExit _ _ runParent _) st _ a -> do { x <- runParent a; return (x, st); }) (\_ -> return ()) emptySnippet
+emptyComp :: (MonadIO parentAlgebra, TightropeImpl impl) => Component' impl props parentAlgebra parentAlgebra
+emptyComp = comp (\_ -> ()) () (\(EnterExit _ _ runParent _) st _ a -> do { x <- runParent a; return (x, st); }) (\_ _ -> return ()) (\_ -> return()) emptySnippet
+
+mapProps :: (props' -> props) -> Component' impl props algebra parentAlgebra
+         -> Component' impl props' algebra parentAlgebra
+mapProps f (Component mkSt out runAlgebra construct updateProps template) =
+    Component (mkSt . f) out runAlgebra (\update props -> construct update (f props))
+              (updateProps . f) template
 
 -- * Mounting support
 
-mount_ :: forall impl st out childAlgebra algebra parentAlgebra.
+mount_ :: forall impl props st out childAlgebra algebra parentAlgebra.
           (MonadIO algebra, RawIO algebra, TightropeImpl impl) =>
           (st -> EmbeddedAlgebraWrapper childAlgebra algebra -> out -> out)
-       -> (st -> Component' impl childAlgebra algebra)
+       -> Component' impl props childAlgebra algebra
+       -> (st -> props)
        -> Snippet' impl (MountedComponent impl childAlgebra algebra) out st algebra parentAlgebra
-mount_ setChild mkComponent = Snippet createUnder updateElem finish
+mount_ setChild component mkProps = Snippet createUnder updateElem finish
   where
     createUnder :: RunAlgebra algebra -> st -> IO st -> SnippetConstructor impl (MountedComponent impl childAlgebra algebra) out
     createUnder update st getSt siblingPos =
-        case mkComponent st of
+        case component of
           Component { componentTemplate = componentTemplate@(Snippet { .. })
                     , .. } -> do
             stVar      <- newEmptyMVar
@@ -115,11 +126,13 @@ mount_ setChild mkComponent = Snippet createUnder updateElem finish
                                                wasDirty <- atomicModifyIORef isDirtyV (True,)
                                                when (not wasDirty) (requestFrame (Proxy :: Proxy impl) redraw)
                                         pure x
+                initialProps = mkProps st
+                initialState = componentInitState initialProps
 
-            putMVar stVar componentStateInitial
+            putMVar stVar initialState
 
             ConstructedSnippet (Endo mkOut) scheduled siblingPos' childPos compIntSt <-
-                snippetCreateUnder runAlgebra'' componentStateInitial (readMVar stVar) siblingPos
+                snippetCreateUnder runAlgebra'' initialState (readMVar stVar) siblingPos
 
             atomicWriteIORef intStVar compIntSt
             let !initialOut = mkOut componentEmptyOut
@@ -129,12 +142,17 @@ mount_ setChild mkComponent = Snippet createUnder updateElem finish
 
             pure (ConstructedSnippet (Endo (setChild st (EmbeddedAlgebraWrapper (liftIO . runAlgebra''))))
                                      (AfterAction [ \_ -> runAfterAction scheduled initialOut
-                                                  , \_ -> runAlgebra'' (componentOnConstruct runAlgebra'') ])
+                                                  , \_ -> runAlgebra'' (componentOnConstruct runAlgebra'' initialProps)
+                                                  ])
                                      siblingPos' childPos intSt)
 
     updateElem run st getSt insPos mc@MountedComponent { .. } =
         do (_, insPos', childPos) <- readMVar mountedInsPosV
-           pure (ConstructedSnippet (Endo (setChild st mountedAlgebraWrapper))
-                                    mempty insPos' childPos mc)
+           let newProps = mkProps st
+           case mountedAlgebraWrapper of
+             EmbeddedAlgebraWrapper runAlgebra ->
+                 pure (ConstructedSnippet (Endo (setChild st mountedAlgebraWrapper))
+                                          (AfterAction [ \_ -> runAlgebra (componentOnPropsUpdate component newProps) ])
+                                          insPos' childPos mc)
 
     finish = mountedFinish

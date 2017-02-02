@@ -227,6 +227,34 @@ style :: forall impl strategy x st algebra parentAlgebra.
      -> Attribute' impl (AttrableState strategy x st) st algebra parentAlgebra
 style = attr' (Proxy :: Proxy (AttrStrategy x)) setStyle
 
+initialValue_ :: forall impl strategy x st algebra parentAlgebra.
+                 ( strategy ~ AttrStrategy x
+                 , TightropeImpl impl, Attrable strategy x st ) =>
+                 x
+              -> Attribute' impl (() :++ AttrableState strategy x st) st algebra parentAlgebra
+initialValue_ v = keyedAttr_ (\_ -> ()) (attr (fromString "value") v)
+
+keyedAttr_ :: forall impl key attrSt st algebra parentAlgebra.
+              Eq key => (st -> key)
+           -> Attribute' impl attrSt st algebra parentAlgebra
+           -> Attribute' impl (key :++ attrSt) st algebra parentAlgebra
+keyedAttr_ mkKey (Attribute set update finish) =
+    Attribute set' update' finish'
+    where
+      set' :: RunAlgebra algebra -> st -> IO st -> Node impl -> IO (key :++ attrSt)
+      set' run st getSt node = do
+        let initialKey = mkKey st
+        (initialKey :++) <$> set run st getSt node
+
+      update' :: RunAlgebra algebra -> st -> Node impl -> (key :++ attrSt) -> IO (key :++ attrSt)
+      update' run st node oldSt'@(oldKey :++ oldSt) =
+          let newKey = mkKey st
+          in if newKey == oldKey
+             then return oldSt'
+             else (newKey :++) <$> update run st node oldSt
+
+      finish' (_ :++ attrSt) = finish attrSt
+
 -- * Keyed attributes
 
 -- instance ( TightropeImpl impl, AttrValue impl x, impl ~ impl') => AttrValue impl (Keyed impl' x st') where

@@ -241,6 +241,60 @@ cond_ cond template =
     guarded_ (\s -> if cond s then Just s else Nothing)
              (project_ (\(Embedded _ s _) -> s) template)
 
+choice_ :: forall impl aInt bInt a b state out algebra parentAlgebra.
+           (state -> Either a b)
+        -> Snippet' impl aInt out (Embedded () state a) algebra parentAlgebra
+        -> Snippet' impl bInt out (Embedded () state b) algebra parentAlgebra
+        -> Snippet' impl (Either aInt bInt) out state algebra parentAlgebra
+choice_ mkKey (Snippet aCreate aUpdate aFinish) (Snippet bCreate bUpdate bFinish) =
+    Snippet create update finish
+  where
+    create :: RunAlgebra algebra -> state -> IO state -> SnippetConstructor impl (Either aInt bInt) out
+    create run st getSt siblingPos =
+        case mkKey st of
+          Left aSt -> wrapLeft <$> aCreate run (Embedded st aSt ()) (getLeft getSt) siblingPos
+          Right bSt -> wrapRight <$> bCreate run (Embedded st bSt ()) (getRight getSt) siblingPos
+
+    update :: RunAlgebra algebra -> state -> IO state -> SnippetUpdater impl (Either aInt bInt) out
+    update run st getSt siblingPos oldSt =
+        case (oldSt, mkKey st) of
+          (Left oldASt, Left newASt) ->
+              wrapLeft <$> aUpdate run (Embedded st newASt ()) (getLeft getSt) siblingPos oldASt
+          (Left oldASt, Right newBSt) ->
+              aFinish oldASt >>
+              (wrapRight <$> bCreate run (Embedded st newBSt ()) (getRight getSt) siblingPos)
+          (Right oldBSt, Right newBSt) ->
+              wrapRight <$> bUpdate run (Embedded st newBSt ()) (getRight getSt) siblingPos oldBSt
+          (Right oldBSt, Left newASt) ->
+              bFinish oldBSt >>
+              (wrapLeft <$> aCreate run (Embedded st newASt ()) (getLeft getSt) siblingPos)
+
+    finish (Left a) = aFinish a
+    finish (Right b) = bFinish b
+
+    getLeft getSt = do
+      st <- getSt
+      let Left aSt = mkKey st
+      pure (Embedded st aSt ())
+    getRight getSt = do
+      st <- getSt
+      let Right bSt = mkKey st
+      pure (Embedded st bSt ())
+
+    wrapLeft (ConstructedSnippet mkOut after siblingPos childPos intSt) =
+        ConstructedSnippet mkOut after siblingPos childPos (Left intSt)
+    wrapRight (ConstructedSnippet mkOut after siblingPos childPos intSt) =
+        ConstructedSnippet mkOut after siblingPos childPos (Right intSt)
+
+if_ :: (st -> Bool)
+    -> Snippet' impl aInt out st algebra parentAlgebra
+    -> Snippet' impl bInt out st algebra parentAlgebra
+    -> Snippet' impl (Either aInt bInt) out st algebra parentAlgebra
+if_ cond true_ false_ =
+    choice_ (\s -> if cond s then Left () else Right ())
+            (project_ parent true_)
+            (project_ parent false_)
+
 guarded_ :: forall impl st st' child out algebra parentAlgebra.
             (st -> Maybe st')
          -> Snippet' impl child out (Embedded () st st') algebra parentAlgebra

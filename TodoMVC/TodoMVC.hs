@@ -32,13 +32,14 @@ main = do Just document <- currentDocument
           addStylesheet "http://todomvc.com/examples/backbone/node_modules/todomvc-common/base.css"
           addStylesheet "http://todomvc.com/examples/backbone/node_modules/todomvc-app-css/index.css"
 
-          mountComponent (toElement body) todoMvc
+          mountComponent (toElement body) () todoMvc
+          pure ()
 
 data TodoItem = TodoItem { todoItemComplete :: Bool, todoItemName :: String } deriving Show
 data TodoItemList = TodoItemList { todoListEditing :: Maybe Int, todoListItems :: V.Vector TodoItem } deriving Show
 
 --todoMvc :: Component (EnterExi TodoItemList IO) IO
-todoMvc = statefulComp (TodoItemList Nothing mempty) () (\_ -> pure ()) $
+todoMvc = statefulComp (\_ -> TodoItemList Nothing mempty) () (\_ _ -> pure ()) (\_ -> pure ()) $
           (div_
           |- (section_ |+ class_ ("todoapp" :: JSString)
 

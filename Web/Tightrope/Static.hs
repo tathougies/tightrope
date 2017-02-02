@@ -194,8 +194,8 @@ insertAfter prev child =
 
 -- * Backend-specific functions
 
-mountComponent :: forall algebra. Component algebra IO -> IO Node
-mountComponent (Component st emptyOut runAlgebra onCreate (Snippet createTemplate updateTemplate finishTemplate)) =
+mountComponent :: forall props algebra. props -> Component props algebra IO -> IO (props -> IO (), Node)
+mountComponent initialProps (Component mkSt emptyOut runAlgebra onCreate onPropsUpdate (Snippet createTemplate updateTemplate finishTemplate)) =
   do stVar <- newEmptyMVar
      intStVar <- newEmptyMVar
 
@@ -220,18 +220,18 @@ mountComponent (Component st emptyOut runAlgebra onCreate (Snippet createTemplat
            pure x
 
          getSt = readMVar stVar
+         initialState = mkSt initialProps
 
-     putMVar stVar st
+     putMVar stVar initialState
      ConstructedSnippet (Endo mkOut) scheduled _ _ intSt <-
-         createTemplate runAlgebra' st getSt (DOMInsertPos rootNode Nothing)
+         createTemplate runAlgebra' initialState getSt (DOMInsertPos rootNode Nothing)
      let initialOut = mkOut emptyOut
-     modifyMVar_ stVar (\_ -> pure st)
      putMVar intStVar (initialOut, intSt)
 
      runAfterAction scheduled initialOut
-     runAlgebra' (onCreate runAlgebra')
+     runAlgebra' (onCreate runAlgebra' initialProps)
 
-     pure rootNode
+     pure (\newProps -> runAlgebra' (onPropsUpdate newProps), rootNode)
 
 mapNode :: forall m g f.
            Monad m =>
