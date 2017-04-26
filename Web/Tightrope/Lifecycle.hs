@@ -2,27 +2,21 @@ module Web.Tightrope.Lifecycle where
 
 import Web.Tightrope.Types
 
-onCreate :: forall impl state algebra out parentAlgebra.
-            (state -> algebra ()) -> Snippet' impl () out state algebra parentAlgebra
-onCreate action = Snippet create' update' (\_ -> pure ())
-    where create' run st _ pos =
-              pure (ConstructedSnippet mempty (AfterAction [ const (run (action st)) ])
-                                       pos pos ())
-          update' _ _ _ pos () =
-              pure (ConstructedSnippet mempty mempty pos pos ())
+onCreate :: forall impl state algebra out.
+            (state -> algebra ()) -> Snippet' impl out state algebra
+onCreate action = Snippet $ \run st _ pos ->
+                  pure (ConstructedSnippet mempty (AfterAction [ const (run (action st)) ])
+                                           pos pos emptySnippet (pure ()))
 
-afterDraw :: forall impl state out algebra parentAlgebra.
+onFinish :: (state -> IO ()) -> Snippet' impl out state algebra
+onFinish action = Snippet $ \run st _ pos ->
+                  pure (ConstructedSnippet mempty mempty pos pos (onFinish action) (action st))
+
+
+afterDraw :: forall impl state out algebra.
              (RunAlgebra algebra -> state -> out -> IO ())
-          -> Snippet' impl () out state algebra parentAlgebra
+          -> Snippet' impl out state algebra
 afterDraw action =
-    Snippet create' update' (\_ -> pure ())
-  where
-    create' :: RunAlgebra algebra -> state -> IO state -> SnippetConstructor impl () out
-    create' run st _ pos =
+    Snippet $ \run st _ pos ->
         pure (ConstructedSnippet mempty (AfterAction [ \out -> action run st out ])
-                                 pos pos ())
-    update' :: RunAlgebra algebra -> state -> IO state -> SnippetUpdater impl () out
-    update' run st _ pos () =
-        pure (ConstructedSnippet mempty (AfterAction [ \out -> action run st out ])
-                                 pos pos ())
-
+                                 pos pos (afterDraw action) (pure ()))

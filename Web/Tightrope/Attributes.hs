@@ -2,10 +2,12 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module Web.Tightrope.Attributes where
 
 import Web.Tightrope.Types
+import Web.Tightrope.Combinators
 
 import Control.Monad
 
@@ -37,25 +39,29 @@ deriving instance Eq x => Eq (Unit x unit)
 deriving instance Ord x => Ord (Unit x unit)
 
 {-# INLINABLE dynClass #-}
-dynClass :: forall impl st algebra parentAlgebra. TightropeImpl impl =>
-            Text impl -> (st -> Bool) -> Attribute' impl Bool st algebra parentAlgebra
-dynClass className dyn = Attribute set update (\_ -> pure ())
-    where set :: RunAlgebra algebra -> st -> IO st -> Node impl -> IO Bool
-          set update st _ node =
-              do let enabled = dyn st
-                 doUpdate enabled node
-                 pure enabled
+dynClass :: forall impl out st algebra. TightropeImpl impl =>
+            Text impl -> (st -> Bool) -> Attribute' impl out st algebra
+dynClass className dyn =
+    Attribute $
+    Snippet (\run st _ pos@(DOMInsertPos n _) -> do
+               let enabled = dyn st
+               doUpdate enabled n
+               pure (ConstructedSnippet mempty mempty pos pos
+                                        (update enabled) (pure ())))
 
-          update runAlgebra st node enabled =
-              do let enabled' = dyn st
-                 when (enabled' /= enabled) (doUpdate enabled' node)
-                 pure enabled'
+  where
+    update enabled =
+      Snippet (\run st getSt pos@(DOMInsertPos n _) -> do
+                 let enabled' = dyn st
+                 when (enabled' /= enabled) (doUpdate enabled' n)
+                 pure (ConstructedSnippet mempty mempty pos pos
+                                          (update enabled') (pure ())))
 
-          doUpdate enabled node
-              | enabled = enableClass (Proxy :: Proxy impl) node className
-              | otherwise = disableClass (Proxy :: Proxy impl) node className
+    doUpdate enabled node
+      | enabled = enableClass (Proxy :: Proxy impl) node className
+      | otherwise = disableClass (Proxy :: Proxy impl) node className
 
--- * Attributes
+-- -- * Attributes
 
 class AttrValue x where
     type AttrValueState x :: *
@@ -138,122 +144,101 @@ type family AttrStrategy x :: AttributeStrategy where
     AttrStrategy x            = 'ConstAttribute
 
 class Attrable (strategy :: AttributeStrategy ) x st where
-
-    type AttrableState strategy x st :: *
-
     attr' :: TightropeImpl impl => Proxy strategy
           -> (Proxy impl -> Node impl -> Text impl -> Maybe (Text impl) -> IO ())
           -> Text impl -> x
-          -> Attribute' impl (AttrableState strategy x st) st algebra parentAlgebra
+          -> Attribute' impl out st algebra
 
 instance ( st ~ st', Eq (AttrValueState x)
          , AttrValue x ) =>
     Attrable 'FunctionAttribute (st' -> x) st where
 
-    type AttrableState 'FunctionAttribute (st' -> x) st = AttrValueState x
+    attr' _ setAttr (name :: Text impl) fn =
+        Attribute $ Snippet
+        (\run st getSt pos@(DOMInsertPos node _) ->
+             do let (key, value) = attrValue p name v
+                    v = fn st
+                setAttr p node name value
+                pure (ConstructedSnippet mempty mempty pos pos
+                                         (go key) (pure ())))
 
-    attr' _ setAttr (name :: Text impl) fn = Attribute set update (\_ -> pure ())
-      where
-        p :: Proxy impl
-        p = Proxy
+        where
+          p :: Proxy impl
+          p = Proxy
 
-        set :: RunAlgebra algebra -> st -> IO st -> Node impl -> IO (AttrValueState x)
-        set run st _ node =
-            do let (key, value) = attrValue p name v
-                   v = fn st
-               setAttr p node name value
-               pure key
-
-        update :: RunAlgebra algebra -> st -> Node impl -> AttrValueState x -> IO (AttrValueState x)
-        update _ st node oldKey = do
-          let (key, value) = attrValue p name v
-              v = fn st
-          if key /= oldKey
-            then do
-              setAttr p node name value
-              pure key
-            else pure oldKey
+          go oldKey =
+            Snippet $ \run st getSt pos@(DOMInsertPos node _) -> do
+            let (key, value) = attrValue p name v
+                v = fn st
+            newKey <- if key /= oldKey
+                      then setAttr p node name value >> pure key
+                      else pure oldKey
+            pure (ConstructedSnippet mempty mempty pos pos (go newKey) (pure ()))
 
 instance st ~ st' => Attrable 'KeyedAttribute (Keyed x st') st where
-    type AttrableState 'KeyedAttribute (Keyed x st') st = x
+    attr' _ setAttr name (Keyed mkKey mkValue) =
+        Attribute $
+        switch_ mkKey $ \key ->
+        let Attribute x = attr' (Proxy :: Proxy ConstAttribute) setAttr name (mkValue key)
+        in x
 
-    attr' _ setAttr (name :: Text impl) (Keyed mkKey mkValue) = Attribute set update (\_ -> pure ())
-      where
-        p :: Proxy impl
-        p = Proxy
+--         set :: RunAlgebra algebra -> st -> IO st -> Node impl -> IO x
+--         set run st _ node =
+--             do let key = mkKey st
+--                    v = mkValue key
+--                setAttr p node name (fromText <$> v)
+--                pure key
 
-        set :: RunAlgebra algebra -> st -> IO st -> Node impl -> IO x
-        set run st _ node =
-            do let key = mkKey st
-                   v = mkValue key
-               setAttr p node name (fromText <$> v)
-               pure key
-
-        update :: RunAlgebra algebra -> st -> Node impl -> x -> IO x
-        update _ st node oldKey =
-            let newKey = mkKey st
-                v = mkValue newKey
-            in if oldKey /= newKey
-               then do setAttr p node name (fromText <$> v)
-                       pure newKey
-               else pure oldKey
+--         update :: RunAlgebra algebra -> st -> Node impl -> x -> IO x
+--         update _ st node oldKey =
+--             let newKey = mkKey st
+--                 v = mkValue newKey
+--             in if oldKey /= newKey
+--                then do setAttr p node name (fromText <$> v)
+--                        pure newKey
+--                else pure oldKey
 
 instance AttrValue x => Attrable 'ConstAttribute x st where
-    type AttrableState 'ConstAttribute x st = ()
 
-    attr' _ setAttr (name :: Text impl) v = Attribute set (\_ _ _ -> pure) (\_ -> pure ())
+    attr' _ setAttr (name :: Text impl) v =
+        Attribute $
+        Snippet (\run st getSt pos@(DOMInsertPos node _) ->
+                  let (_, value) = attrValue p name v
+                  in setAttr p node name value >>
+                     pure (ConstructedSnippet mempty mempty pos pos emptySnippet (pure ())))
       where
         p :: Proxy impl
         p = Proxy
 
-        set :: RunAlgebra algebra -> st -> IO st -> Node impl -> IO ()
-        set run st _ node =
-            let (_, value) = attrValue p name v
-            in setAttr p node name value
-
-attr :: forall impl strategy x st algebra parentAlgebra.
+attr :: forall impl strategy x st out algebra.
         ( strategy ~ AttrStrategy x
         , TightropeImpl impl, Attrable strategy x st ) =>
         Text impl -> x
-     -> Attribute' impl (AttrableState strategy x st) st algebra parentAlgebra
+     -> Attribute' impl out st algebra
 attr = attr' (Proxy :: Proxy (AttrStrategy x)) setAttribute
 
--- * Styles
+-- -- * Styles
 
-style :: forall impl strategy x st algebra parentAlgebra.
+style :: forall impl strategy x out st algebra.
         ( strategy ~ AttrStrategy x
         , TightropeImpl impl, Attrable strategy x st ) =>
         Text impl -> x
-     -> Attribute' impl (AttrableState strategy x st) st algebra parentAlgebra
+     -> Attribute' impl out st algebra
 style = attr' (Proxy :: Proxy (AttrStrategy x)) setStyle
 
-initialValue_ :: forall impl strategy x st algebra parentAlgebra.
+initialValue_ :: forall impl strategy x out st algebra.
                  ( strategy ~ AttrStrategy x
                  , TightropeImpl impl, Attrable strategy x st ) =>
                  x
-              -> Attribute' impl (() :++ AttrableState strategy x st) st algebra parentAlgebra
+              -> Attribute' impl out st algebra
 initialValue_ v = keyedAttr_ (\_ -> ()) (attr (fromString "value") v)
 
-keyedAttr_ :: forall impl key attrSt st algebra parentAlgebra.
+keyedAttr_ :: forall impl key out st algebra.
               Eq key => (st -> key)
-           -> Attribute' impl attrSt st algebra parentAlgebra
-           -> Attribute' impl (key :++ attrSt) st algebra parentAlgebra
-keyedAttr_ mkKey (Attribute set update finish) =
-    Attribute set' update' finish'
-    where
-      set' :: RunAlgebra algebra -> st -> IO st -> Node impl -> IO (key :++ attrSt)
-      set' run st getSt node = do
-        let initialKey = mkKey st
-        (initialKey :++) <$> set run st getSt node
-
-      update' :: RunAlgebra algebra -> st -> Node impl -> (key :++ attrSt) -> IO (key :++ attrSt)
-      update' run st node oldSt'@(oldKey :++ oldSt) =
-          let newKey = mkKey st
-          in if newKey == oldKey
-             then return oldSt'
-             else (newKey :++) <$> update run st node oldSt
-
-      finish' (_ :++ attrSt) = finish attrSt
+           -> Attribute' impl out st algebra
+           -> Attribute' impl out st algebra
+keyedAttr_ mkKey (Attribute go) =
+    Attribute (keyedUpdates_ mkKey go)
 
 -- * Keyed attributes
 

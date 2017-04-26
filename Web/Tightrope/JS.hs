@@ -5,7 +5,7 @@
 module Web.Tightrope.JS
     ( DOMImpl
     , Snippet, Attribute, Component
-    , SomeSnippet, Node
+    , Node
 
     , jss
     , addStylesheet
@@ -26,7 +26,7 @@ module Web.Tightrope.JS
 
     , cutEvent, copyEvent, pasteEvent
 
-    , blurEvent
+    , blurEvent, focusEvent
 
     , customHandler ) where
 
@@ -152,10 +152,27 @@ instance TightropeImpl DOMImpl where
     setAttribute _ n "class" Nothing = pure ()
     setAttribute _ n "class" (Just v) =
         DOM.setClassName (DOM.uncheckedCastTo DOM.Element n) v
-    setAttribute _ n key Nothing =
+    setAttribute _ n key Nothing = do
         DOM.removeAttribute (DOM.uncheckedCastTo DOM.Element n) key
-    setAttribute _ n key (Just value) =
+        case key of
+          "checked" ->  do
+              n' <- DOM.castTo DOM.HTMLInputElement n
+              case n' of
+                Just n -> DOM.setChecked n False
+                Nothing -> pure ()
+          _ -> pure ()
+    setAttribute _ n key (Just value) = do
         DOM.setAttribute (DOM.uncheckedCastTo DOM.Element n) key value
+        case key of
+          "checked" -> do
+              n' <- DOM.castTo DOM.HTMLInputElement n
+              case n' of
+                Just n -> DOM.setChecked n $
+                          case value of
+                            "checked" -> True
+                            _ -> False
+                Nothing -> pure ()
+          _ -> pure ()
 
     setStyle _ n key Nothing =
         do Just style <- DOM.getStyle (DOM.uncheckedCastTo DOM.Element n)
@@ -179,7 +196,6 @@ instance AttrValue JSString where
 -- * Specializations
 
 type Snippet = Snippet' DOMImpl
-type SomeSnippet = SomeSnippet' DOMImpl
 type Attribute = Attribute' DOMImpl
 type Component = Component' DOMImpl
 type Node = TT.Node DOMImpl
@@ -239,7 +255,7 @@ requestAnimationFrameHs doDraw = do
                 _doRedraw ts
 
 mountComponent :: DOM.Element -> props -> Component props algebra IO -> IO (props -> IO ())
-mountComponent el initialProps (Component mkSt emptyOut runAlgebra onCreate onPropsChange (Snippet createTemplate updateTemplate finishTemplate :: Snippet intSt st out algebra IO))  =
+mountComponent el initialProps (Component mkSt emptyOut runAlgebra onCreate onPropsChange (Snippet create :: Snippet out st algebra))  =
   do stVar <- newEmptyMVar
      intStVar <- newIORef (error "intStVar not set")
      outVar <- newIORef (error "outVar not set")
@@ -249,14 +265,15 @@ mountComponent el initialProps (Component mkSt emptyOut runAlgebra onCreate onPr
 
      isDirtyV <- newIORef False
      let redraw _ = do atomicWriteIORef isDirtyV False
-                       (st, intSt) <- bracket (takeMVar stVar) (putMVar stVar) $ \st ->
-                                      (st,) <$> readIORef intStVar
+                       (st, (Snippet update, _)) <-
+                           bracket (takeMVar stVar) (putMVar stVar) $ \st ->
+                           (st,) <$> readIORef intStVar
 
 
-                       ConstructedSnippet (Endo mkOut) scheduled _ _ intSt' <-
-                           updateTemplate runAlgebra' st (readMVar stVar) (DOMInsertPos (DOM.toNode el) Nothing) intSt
+                       ConstructedSnippet (Endo mkOut) scheduled _ _ update' finish <-
+                           update runAlgebra' st (readMVar stVar) (DOMInsertPos (DOM.toNode el) Nothing)
 
-                       atomicWriteIORef intStVar intSt'
+                       atomicWriteIORef intStVar (update', finish)
 
                        let out' = mkOut emptyOut
                        atomicWriteIORef outVar out'
@@ -268,7 +285,7 @@ mountComponent el initialProps (Component mkSt emptyOut runAlgebra onCreate onPr
 
              do (x, shouldRedraw) <- modifyMVar stVar $ \st ->
                      do out <- readIORef outVar
-                        intSt <- readIORef intStVar
+--                        (update', finish) <- readIORef intStVar
                         oldStNm <- makeStableName st
                         (x, !st') <- runAlgebra (EnterExit (putMVar stVar) (takeMVar stVar) id runAlgebra') st out a
                         newStNm <- makeStableName st'
@@ -285,10 +302,10 @@ mountComponent el initialProps (Component mkSt emptyOut runAlgebra onCreate onPr
          initialState = mkSt initialProps
 
      putMVar stVar initialState
-     ConstructedSnippet (Endo mkOut) scheduled _ _ intSt <-
-         createTemplate runAlgebra' initialState getSt (DOMInsertPos (DOM.toNode el) Nothing)
+     ConstructedSnippet (Endo mkOut) scheduled _ _ update finish <-
+         create runAlgebra' initialState getSt (DOMInsertPos (DOM.toNode el) Nothing)
 
-     atomicWriteIORef intStVar intSt
+     atomicWriteIORef intStVar (update, finish)
 
      let !initialOut = mkOut emptyOut
      atomicWriteIORef outVar initialOut
@@ -333,26 +350,30 @@ cutEvent = Event "cut"
 copyEvent = Event "copy"
 pasteEvent = Event "paste"
 
-change, blurEvent :: Event DOMImpl DOM.Event
+change, focusEvent, blurEvent :: Event DOMImpl DOM.Event
+focusEvent = Event "focus"
 blurEvent = Event "blur"
 change = Event "change"
 
 -- * Custom events
 
 customHandler ::
-     forall evt state algebra parentAlgebra.
+     forall evt out state algebra.
      (Node -> DOM.Callback (DOM.JSVal -> IO ()) -> IO ())
   -> (Node -> DOM.Callback (DOM.JSVal -> IO ()) -> IO ())
   -> (RunAlgebra algebra -> state -> DOM.JSVal -> IO ())
-  -> Attribute (IO ()) state algebra parentAlgebra
+  -> Attribute out state algebra
 customHandler attachHandler detachHandler handler =
-    Attribute set (\_ _ _ -> pure) (\done -> done)
+    Attribute $
+    Snippet (\run st getSt pos@(DOMInsertPos n _) -> do
+               let handler' e = getSt >>= \st -> handler run st e
+
+               listener <- DOM.syncCallback1 DOM.ContinueAsync handler'
+               attachHandler n listener
+
+               let finish = detachHandler n listener
+               pure (ConstructedSnippet mempty mempty pos pos (go finish) finish))
+
   where
-    set :: RunAlgebra algebra -> state -> IO state -> Node -> IO (IO ())
-    set run st getSt n =
-        do let handler' e = getSt >>= \st -> handler run st e
-
-           listener <- DOM.syncCallback1 DOM.ContinueAsync handler'
-           attachHandler n listener
-
-           pure (detachHandler n listener)
+    go finish = Snippet $ \_ _ _ pos ->
+                pure (ConstructedSnippet mempty mempty pos pos (go finish) finish)

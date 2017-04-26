@@ -8,10 +8,10 @@ import Web.Tightrope.Types
 import Web.Tightrope.Attributes
 
 type GenericAttribute =
-    forall impl strategy x st algebra parentAlgebra.
+    forall impl strategy x out st algebra.
     ( strategy ~ AttrStrategy x
     , TightropeImpl impl, Attrable strategy x st) =>
-    x -> Attribute' impl (AttrableState strategy x st) st algebra parentAlgebra
+    x -> Attribute' impl out st algebra
 
 class_ :: GenericAttribute
 class_ = attr "class"

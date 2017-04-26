@@ -1,4 +1,5 @@
-module Web.Tightrope.Event where
+module Web.Tightrope.Event
+    ( on, onBodyEvent, onWindowResize ) where
 
 import Web.Tightrope.Types
 
@@ -9,41 +10,49 @@ import Data.Proxy
 
 import GHC.TypeLits
 
+finishEventHandler :: IO () -> Snippet' impl out st algebra
+finishEventHandler finish =
+    Snippet $ \_ _ _ pos ->
+    pure (ConstructedSnippet mempty mempty pos pos (finishEventHandler finish) finish)
+
 on, onBodyEvent ::
-    forall impl evt evtName algebra state parentAlgebra.
+    forall impl evt evtName algebra out state.
     TightropeImpl impl => Event impl evt
  -> (GenericRunAlgebra algebra -> state -> ReaderT evt IO ())
- -> Attribute' impl (IO ()) state algebra parentAlgebra
+ -> Attribute' impl out state algebra
 on evt action =
-    Attribute set (\_ _ _ -> pure) (\done -> done)
-  where
-    set :: RunAlgebra algebra -> state -> IO state -> Node impl -> IO (IO ())
-    set runAlgebra st getSt n =
-        let runAlgebra' :: forall a m. MonadIO m => algebra a -> m a
-            runAlgebra' x = liftIO (runAlgebra x)
-        in addEventListener n evt (liftIO getSt >>= action runAlgebra')
+    Attribute $
+    Snippet (\run st getSt pos@(DOMInsertPos n _) -> do
+             let runAlgebra' :: forall a m. MonadIO m => algebra a -> m a
+                 runAlgebra' x = liftIO (run x)
+
+             finish <- addEventListener n evt (liftIO getSt >>= action runAlgebra')
+             pure (ConstructedSnippet mempty mempty pos pos
+                                      (finishEventHandler finish) finish))
 
 onBodyEvent evt action =
-    Attribute set (\_ _ _ -> pure) (\done -> done)
-  where
-    set :: RunAlgebra algebra -> state -> IO state -> Node impl -> IO (IO ())
-    set runAlgebra st getSt n =
-        let runAlgebra' :: forall a m. MonadIO m => algebra a -> m a
-            runAlgebra' x = liftIO (runAlgebra x)
-        in addBodyEventListener evt (liftIO getSt >>= action runAlgebra')
+    Attribute $
+    Snippet (\run st getSt pos@(DOMInsertPos n _) -> do
+               let runAlgebra' :: forall a m. MonadIO m => algebra a -> m a
+                   runAlgebra' x = liftIO (run x)
+
+               finish <- addBodyEventListener evt (liftIO getSt >>= action runAlgebra')
+
+               pure (ConstructedSnippet mempty mempty pos pos (finishEventHandler finish) finish))
 
 onWindowResize ::
-    forall impl algebra state parentAlgebra. TightropeImpl impl =>
+    forall impl algebra out state. TightropeImpl impl =>
     (GenericRunAlgebra algebra -> state -> (Double, Double) -> IO ())
- -> Attribute' impl (IO ()) state algebra parentAlgebra
+ -> Attribute' impl out state algebra
 onWindowResize action =
-    Attribute set (\_ _ _ -> pure) (\done -> done)
-  where
-    set :: RunAlgebra algebra -> state -> IO state -> Node impl -> IO (IO ())
-    set runAlgebra st getSt _ =
-        let runAlgebra' :: forall a m. MonadIO m => algebra a -> m a
-            runAlgebra' x = liftIO (runAlgebra x)
-        in addResizeListener (Proxy :: Proxy impl) $
-           \dims -> do
-             st <- getSt
-             action runAlgebra' st dims
+    Attribute $
+    Snippet (\run st getSt pos -> do
+               let runAlgebra' :: forall a m. MonadIO m => algebra a -> m a
+                   runAlgebra' x = liftIO (run x)
+
+               finish <- addResizeListener (Proxy :: Proxy impl) $
+                         \dims -> do
+                           st <- getSt
+                           action runAlgebra' st dims
+
+               pure (ConstructedSnippet mempty mempty pos pos (finishEventHandler finish) finish))

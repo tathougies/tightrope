@@ -11,7 +11,7 @@ module Web.Tightrope.Generic
 
     , module Web.Tightrope.Types
 
-    , Snippet, Attribute, Component, SomeSnippet, Node ) where
+    , Snippet, Attribute, Component, Node ) where
 
 import Web.Tightrope.Attributes
 import Web.Tightrope.Element
@@ -28,4 +28,3 @@ import Web.Tightrope.Types hiding (Text)
 type Snippet = Snippet'
 type Attribute = Attribute'
 type Component = Component'
-type SomeSnippet = SomeSnippet'

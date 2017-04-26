@@ -10,6 +10,7 @@ import Control.Monad.IO.Class
 import Control.Monad.Reader
 import Control.Monad.State
 import Control.Applicative
+import Control.Lens
 
 import qualified Data.Text as T
 import Data.Monoid
@@ -21,6 +22,8 @@ import Data.Typeable
 import Data.JSString (JSString)
 import Data.JSString.Text (textToJSString, textFromJSString)
 #endif
+
+import System.Mem.StableName
 
 class IsText t where
     fromText :: T.Text -> t
@@ -95,34 +98,19 @@ data DOMInsertPos impl
 
 newtype AfterAction out = AfterAction [ out -> IO () ]
 
-type SnippetConstructor impl intSt out = DOMInsertPos impl -> IO (ConstructedSnippet impl intSt out)
-type SnippetUpdater impl intSt out = DOMInsertPos impl -> intSt -> IO (ConstructedSnippet impl intSt out)
-data ConstructedSnippet impl intSt out
+newtype Snippet' impl out state algebra = Snippet (RunAlgebra algebra -> state -> IO state -> DOMInsertPos impl -> IO (ConstructedSnippet impl out state algebra))
+data ConstructedSnippet impl out state algebra
     = ConstructedSnippet
     { constructedSnippetOut  :: Endo out
     , constructedAfterAction :: AfterAction out
     , constructedSiblingPos  :: DOMInsertPos impl
     , constructedChildPos    :: DOMInsertPos impl
-    , constructedState       :: intSt }
+    , constructedSnippetNext :: Snippet' impl out state algebra
+    , constructedSnippetFinish :: IO () }
 
--- type SnippetConstructor internalSt out = StateT DOMInsertPos (WriterT (Endo out, AfterAction out) IO) (DOMInsertPos, internalSt)
--- type SnippetUpdater internalSt out = StateT (DOMInsertPos, internalSt) (WriterT (Endo out, AfterAction out) IO) DOMInsertPos
+newtype Attribute' impl out st algebra = Attribute (Snippet' impl out st algebra)
 
-data a :++ b = !a :++ !b
-
-data Snippet' impl internalSt out state algebra (parentAlgebra :: * -> *)
-    = Snippet
-    { snippetCreateUnder :: RunAlgebra algebra -> state -> IO state -> SnippetConstructor impl internalSt out
-    , snippetUpdateElem  :: RunAlgebra algebra -> state -> IO state ->  SnippetUpdater impl internalSt out
-    , snippetFinish      :: internalSt -> IO () }
-
-type GenericSnippet = forall impl st out algebra parentAlgebra. TightropeImpl impl => Snippet' impl (Node impl) st out algebra parentAlgebra
-
-data Attribute' impl attrSt state algebra (parentAlgebra :: * -> *)
-    = Attribute
-    { attributeSet    :: RunAlgebra algebra -> state -> IO state -> Node impl -> IO attrSt
-    , attributeUpdate :: RunAlgebra algebra -> state -> Node impl -> attrSt -> IO attrSt
-    , attributeFinish :: attrSt -> IO () }
+type GenericSnippet = forall impl st out algebra. TightropeImpl impl => Snippet' impl st out algebra
 
 data Component' impl props (algebra :: * -> *) (parentAlgebra :: * -> *) where
     Component :: MonadIO parentAlgebra =>
@@ -131,33 +119,20 @@ data Component' impl props (algebra :: * -> *) (parentAlgebra :: * -> *) where
                  , componentRunAlgebra    :: forall a. EnterExit state out parentAlgebra algebra -> state -> out -> algebra a -> IO (a, state)
                  , componentOnConstruct   :: RunAlgebra algebra -> props -> algebra ()
                  , componentOnPropsUpdate :: props -> algebra ()
-                 , componentTemplate      :: Snippet' impl internalSt out state algebra parentAlgebra }
+                 , componentTemplate      :: Snippet' impl out state algebra }
               -> Component' impl props algebra parentAlgebra
 
 data MountedComponent impl algebra parentAlgebra where
     MountedComponent :: MonadIO parentAlgebra =>
                         { mountedStateV         :: MVar state
-                        , mountedIntStateV      :: IORef internalSt
                         , mountedOutV           :: IORef out
                         , mountedInsPosV        :: MVar (DOMInsertPos impl, DOMInsertPos impl, DOMInsertPos impl)
                         , mountedEmptyOut       :: out
                         , mountedAlgebraWrapper :: EmbeddedAlgebraWrapper algebra parentAlgebra
                         , mountedFinish         :: IO ()
                         , mountedRunAlgebra     :: forall a. EnterExit state out parentAlgebra algebra -> state -> out -> algebra a ->  IO (a, state)
-                        , mountedTemplate       :: Snippet' impl internalSt out state algebra parentAlgebra }
+                        , mountedTemplate       :: Snippet' impl out state algebra }
                      -> MountedComponent impl algebra parentAlgebra
-
-data SomeSnippet' impl out st algebra parentAlgebra where
-    SomeSnippet ::
-        Snippet' impl internalSt out st algebra parentAlgebra ->
-        SomeSnippet' impl out st algebra parentAlgebra
-
-data RenderedSnippet impl out st algebra where
-    RenderedSnippet ::
-        !intSt ->
-        (RunAlgebra algebra -> st -> IO st -> SnippetUpdater impl intSt out) ->
-        (intSt -> IO ()) ->
-        RenderedSnippet impl out st algebra
 
 data Embedded index parent current
     = Embedded { parent :: parent
@@ -173,10 +148,20 @@ runAfterAction act out = go' act out
     where go' (AfterAction []) out = pure ()
           go' (AfterAction (x:xs)) out = x out >> go' (AfterAction xs) out
 
-emptySnippet :: Snippet' impl () out state algebra parentAlgebra
-emptySnippet = Snippet (\_ _ _ pos -> pure (ConstructedSnippet mempty mempty pos pos ()))
-                       (\_ _ _ pos () -> pure (ConstructedSnippet mempty mempty pos pos ()))
-                       (\_ -> return ())
+emptySnippet :: Snippet' impl out state algebra
+emptySnippet = Snippet $ \_ _ _ pos ->
+               pure (ConstructedSnippet mempty mempty pos pos emptySnippet (return ()))
+
+instance Monoid (Snippet' impl out state m) where
+    mempty = emptySnippet
+    mappend (Snippet left) (Snippet right) =
+        Snippet $ \runAlgebra st getSt siblingPos ->
+            do ConstructedSnippet leftOut leftScheduled siblingPos' _ left' finishLeft <-
+                   left runAlgebra st getSt siblingPos
+               ConstructedSnippet rightOut rightScheduled siblingPos'' childPos right' finishRight <-
+                   right runAlgebra st getSt siblingPos'
+               pure (ConstructedSnippet (leftOut <> rightOut) (leftScheduled <> rightScheduled)
+                                        siblingPos'' childPos (mappend left' right') (finishLeft >> finishRight))
 
 -- * EnterExit monad
 
@@ -260,3 +245,20 @@ instance TightropeImpl DummyImpl where
     setNodeValue _ _ _ = pure ()
 
     requestFrame _ _ = pure ()
+
+(~~~) :: (MonadState s m, MonadIO m) => Lens' s v -> v -> m ()
+lens ~~~ v =
+    do oldVal <- use lens
+       oldNm <- liftIO (makeStableName oldVal)
+       newNm <- liftIO (makeStableName v)
+       if oldNm /= newNm
+          then modify (lens .~ v)
+          else pure ()
+
+(~==~) :: (MonadState s m, MonadIO m, Eq v) => Lens' s v -> v -> m ()
+lens ~==~ v =
+    do oldVal <- use lens
+       if oldVal /= v
+          then modify (lens .~ v)
+          else pure ()
+infixr 4 ~~~, ~==~

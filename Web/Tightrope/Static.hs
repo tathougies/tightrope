@@ -8,9 +8,10 @@ module Web.Tightrope.Static
     , StaticNode(..)
     , IONode, FrozenNode
 
-    , Snippet, Attribute, Component
-    , SomeSnippet, Node
+    , Snippet, Attribute
+    , Component, Node
 
+    , renderSnippetStatic
     , mountComponent
     , freezeNode ) where
 
@@ -56,7 +57,6 @@ deriving instance Show FrozenNode
 -- * Specializations
 
 type Snippet = Snippet' StaticImpl
-type SomeSnippet = SomeSnippet' StaticImpl
 type Attribute = Attribute' StaticImpl
 type Component = Component' StaticImpl
 type Node = TT.Node StaticImpl
@@ -99,11 +99,14 @@ instance TightropeImpl StaticImpl where
         case value of
           Nothing -> M.delete key attrs
           Just value -> M.insert key value attrs
-    setStyle _ node key value =
+    setStyle _ node key value = do
+        tg <- readIORef (nodeTagName node)
+        classes <- readIORef (nodeClasses node)
+        putStrLn ("Set Style " <> show tg <> " " <> show classes <> " " <> show value)
         modifyIORef' (nodeStyle node) $ \styles ->
-        case value of
-          Nothing -> M.delete key styles
-          Just value -> M.insert key value styles
+          case value of
+            Nothing -> M.delete key styles
+            Just value -> M.insert key value styles
 
     setNodeValue _ node content =
         writeIORef (nodeText node) content
@@ -114,6 +117,7 @@ instance TightropeImpl StaticImpl where
 
 newNode, newTextNode :: T.Text -> IO IONode
 newNode tagName =
+    putStrLn ("Create tag " <> show tagName) >> (
     StaticNode
     <$> newIORef Nothing
     <*> newIORef Nothing
@@ -123,7 +127,7 @@ newNode tagName =
     <*> newIORef tagName
     <*> newIORef mempty
     <*> newIORef mempty
-    <*> newIORef mempty
+    <*> newIORef mempty)
 
 newTextNode content =
     StaticText
@@ -194,8 +198,13 @@ insertAfter prev child =
 
 -- * Backend-specific functions
 
+renderSnippetStatic :: props -> Component props algebra IO -> IO FrozenNode
+renderSnippetStatic initialProps comp = do
+  (_, n) <- mountComponent initialProps comp
+  freezeNode n
+
 mountComponent :: forall props algebra. props -> Component props algebra IO -> IO (props -> IO (), Node)
-mountComponent initialProps (Component mkSt emptyOut runAlgebra onCreate onPropsUpdate (Snippet createTemplate updateTemplate finishTemplate)) =
+mountComponent initialProps (Component mkSt emptyOut runAlgebra onCreate onPropsUpdate (Snippet constructTemplate)) =
   do stVar <- newEmptyMVar
      intStVar <- newEmptyMVar
 
@@ -205,14 +214,14 @@ mountComponent initialProps (Component mkSt emptyOut runAlgebra onCreate onProps
          runAlgebra' a = do
            (x, scheduled, out) <-
              bracketOnError (takeMVar stVar) (putMVar stVar) $ \st ->
-                 bracketOnError (takeMVar intStVar) (putMVar intStVar) $ \(out, intSt) -> do
+                 bracketOnError (takeMVar intStVar) (putMVar intStVar) $ \(out, Snippet updateTemplate, finishTemplate) -> do
                    (x, st') <- runAlgebra (EnterExit (putMVar stVar) (takeMVar stVar) id runAlgebra') st out a
 
-                   ConstructedSnippet (Endo mkOut) scheduled _ _ intSt' <-
-                     updateTemplate runAlgebra' st getSt (DOMInsertPos rootNode Nothing) intSt
+                   ConstructedSnippet (Endo mkOut) scheduled _ _ updateTemplate' finishTemplate' <-
+                     updateTemplate runAlgebra' st getSt (DOMInsertPos rootNode Nothing)
 
                    let out' = mkOut emptyOut
-                   putMVar intStVar (out', intSt')
+                   putMVar intStVar (out', updateTemplate', finishTemplate')
                    putMVar stVar st'
                    pure (x, scheduled, out')
 
@@ -223,10 +232,10 @@ mountComponent initialProps (Component mkSt emptyOut runAlgebra onCreate onProps
          initialState = mkSt initialProps
 
      putMVar stVar initialState
-     ConstructedSnippet (Endo mkOut) scheduled _ _ intSt <-
-         createTemplate runAlgebra' initialState getSt (DOMInsertPos rootNode Nothing)
+     ConstructedSnippet (Endo mkOut) scheduled _ _ snippet' finish <-
+         constructTemplate runAlgebra' initialState getSt (DOMInsertPos rootNode Nothing)
      let initialOut = mkOut emptyOut
-     putMVar intStVar (initialOut, intSt)
+     putMVar intStVar (initialOut, snippet', finish)
 
      runAfterAction scheduled initialOut
      runAlgebra' (onCreate runAlgebra' initialProps)
