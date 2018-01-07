@@ -28,7 +28,7 @@ main :: IO ()
 main = do Just document <- currentDocument
           Just body <- getBody document
 
-          setCharset document (Just "utf-8" :: Maybe JSString)
+--          setCharset document (Just "utf-8" :: Maybe JSString)
           addStylesheet "http://todomvc.com/examples/backbone/node_modules/todomvc-common/base.css"
           addStylesheet "http://todomvc.com/examples/backbone/node_modules/todomvc-app-css/index.css"
 
@@ -93,10 +93,10 @@ todoMvc = statefulComp (\_ -> TodoItemList Nothing mempty) () (\_ _ -> pure ()) 
           onNewTodo updateComponent _ =
               do kc <- uiKeyCode
                  Just tgt <- target
-                 Just val <- getValue (uncheckedCastTo HTMLInputElement tgt)
+                 val <- getValue (uncheckedCastTo HTMLInputElement tgt)
 
                  when (kc == 13) $
-                   do liftIO (setValue tgt (Just "" :: Maybe JSString))
+                   do liftIO (setValue tgt ("" :: JSString))
                       updateComponent (insertTodoItem val)
 
 --          itemToggled :: (forall a. StateT TodoItemList IO a -> EventM Element MouseEvent a) -> Embedded Int TodoItemList TodoItem -> EventM Element MouseEvent ()

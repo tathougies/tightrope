@@ -13,10 +13,11 @@ import Control.Exception (bracket, bracketOnError)
 import Data.Monoid
 import Data.IORef
 import Data.Proxy
+import Data.Typeable
 
 import System.Mem.StableName
 
-comp :: (MonadIO parentAlgebra, TightropeImpl impl) =>
+comp :: (MonadIO parentAlgebra, TightropeImpl impl, Typeable state, Typeable out) =>
         (props -> state) -> out
      -> (forall a. EnterExit state out parentAlgebra algebra -> state -> out -> algebra a -> IO (a, state))
      -> (RunAlgebra algebra -> props -> algebra ())
@@ -25,7 +26,7 @@ comp :: (MonadIO parentAlgebra, TightropeImpl impl) =>
      -> Component' impl props algebra parentAlgebra
 comp = Component
 
-statefulComp :: (MonadIO parentAlgebra, TightropeImpl impl) =>
+statefulComp :: (MonadIO parentAlgebra, TightropeImpl impl, Typeable state, Typeable out) =>
                 (props -> state) -> out
              -> (RunAlgebra (EnterExitT state out parentAlgebra) -> props -> EnterExitT state out parentAlgebra ())
              -> (props -> EnterExitT state out parentAlgebra ())

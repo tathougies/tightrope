@@ -12,7 +12,6 @@ onFinish :: (state -> IO ()) -> Snippet' impl out state algebra
 onFinish action = Snippet $ \run st _ pos ->
                   pure (ConstructedSnippet mempty mempty pos pos (onFinish action) (action st))
 
-
 afterDraw :: forall impl state out algebra.
              (RunAlgebra algebra -> state -> out -> IO ())
           -> Snippet' impl out state algebra

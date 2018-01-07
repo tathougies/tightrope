@@ -13,11 +13,12 @@ import Web.Tightrope.Types
 constNodeSnippet :: Node impl -> IO ()
                  -> Snippet' impl st out algebra
 constNodeSnippet n finish =
-    Snippet $ \_ _ _ (DOMInsertPos parent _) ->
-        pure (ConstructedSnippet mempty mempty
-                                 (DOMInsertPos parent (Just n))
-                                 (DOMInsertPos n Nothing)
-                                 (constNodeSnippet n finish) finish)
+    let x = Snippet $ \_ _ _ (DOMInsertPos parent _) ->
+            pure (ConstructedSnippet mempty mempty
+                                     (DOMInsertPos parent (Just n))
+                                     (DOMInsertPos n Nothing)
+                                     x finish)
+    in x
 
 -- * HTML elements
 

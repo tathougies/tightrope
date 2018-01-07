@@ -6,20 +6,20 @@
 
 module Web.Tightrope.Attributes where
 
-import Web.Tightrope.Types
-import Web.Tightrope.Combinators
+import           Web.Tightrope.Types
+import           Web.Tightrope.Combinators
 
-import Control.Monad
+import           Control.Monad
+import           Control.Monad.Identity
 
+import           Data.Proxy
 import qualified Data.Text as T
-import Data.Proxy
-import Data.String
-import Data.Word
-import Data.Monoid
+import           Data.String
+import           Data.Monoid
 
-import GHC.TypeLits
+import           GHC.TypeLits
 
-import Unsafe.Coerce
+import           Unsafe.Coerce
 
 -- * Classes
 
@@ -63,70 +63,6 @@ dynClass className dyn =
 
 -- -- * Attributes
 
-class AttrValue x where
-    type AttrValueState x :: *
-
-    attrValue :: TightropeImpl impl => Proxy impl -> Text impl -> x -> (AttrValueState x, Maybe (Text impl))
-
-instance AttrValue x => AttrValue (Maybe x) where
-    type AttrValueState (Maybe x) = Maybe (AttrValueState x)
-
-    attrValue _ _ Nothing = (Nothing, Nothing)
-    attrValue p nm (Just x) =
-        let (x', v) = attrValue p nm x
-        in (Just x', v)
-
-instance AttrValue String where
-    type AttrValueState String = String
-
-    attrValue _ _ x = (x, Just . fromString $ x)
-
-instance AttrValue T.Text where
-    type AttrValueState T.Text = T.Text
-
-    attrValue _ _ x = (x, Just . fromText $ x)
-
-instance AttrValue Word where
-    type AttrValueState Word = Word
-
-    attrValue _ _ x = (x, Just . fromString . show $ x)
-
-instance AttrValue Int where
-    type AttrValueState Int = Int
-
-    attrValue _ _ x = (x, Just . fromString . show $ x)
-
-instance AttrValue Integer where
-    type AttrValueState Integer = Integer
-
-    attrValue _ _ x = (x, Just . fromString . show $ x)
-
-instance AttrValue Double where
-    type AttrValueState Double = Double
-
-    attrValue _ _ x = (x, Just . fromString . show $ x)
-
-instance AttrValue Float where
-    type AttrValueState Float = Float
-
-    attrValue _ _ x = (x, Just . fromString . show $ x)
-
-instance (AttrValue x, KnownSymbol unit) =>
-    AttrValue (Unit x unit) where
-
-    type AttrValueState (Unit x unit) = AttrValueState x
-
-    attrValue p attrName (Unit x) =
-        let (attrSt, val) = attrValue p attrName x
-            val' = fmap (<> fromString (symbolVal (Proxy :: Proxy unit))) val
-        in (attrSt, val')
-
-instance AttrValue Bool where
-    type AttrValueState Bool = Bool
-
-    attrValue _ _ False = (False, Nothing)
-    attrValue _ name True = (True, Just name)
-
 -- instance (TightropeImpl impl, AttrValue impl x) => AttrValue impl (st -> x) where
 --     type AttrValueState impl (st' -> x) st = FnAttrValueState impl x (st' -> x) st
 
@@ -139,6 +75,7 @@ data AttributeStrategy = FunctionAttribute
                        | ConstAttribute
 
 type family AttrStrategy x :: AttributeStrategy where
+    AttrStrategy (Identity x) = 'ConstAttribute
     AttrStrategy (st -> x)    = 'FunctionAttribute
     AttrStrategy (Keyed x st) = 'KeyedAttribute
     AttrStrategy x            = 'ConstAttribute
@@ -251,3 +188,13 @@ keyedAttr_ mkKey (Attribute go) =
 
 keyed :: Eq x => (st -> x) -> (x -> Maybe T.Text) -> Keyed x st
 keyed = Keyed
+
+instance (AttrValue x, KnownSymbol unit) =>
+    AttrValue (Unit x unit) where
+
+    type AttrValueState (Unit x unit) = AttrValueState x
+
+    attrValue p attrName (Unit x) =
+        let (attrSt, val) = attrValue p attrName x
+            val' = fmap (<> fromString (symbolVal (Proxy :: Proxy unit))) val
+        in (attrSt, val')

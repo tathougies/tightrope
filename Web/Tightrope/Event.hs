@@ -1,5 +1,7 @@
 module Web.Tightrope.Event
-    ( on, onBodyEvent, onWindowResize ) where
+    ( on, onBodyEvent, onWindowResize
+
+    , TightropeEventImpl(..) ) where
 
 import Web.Tightrope.Types
 
@@ -56,3 +58,55 @@ onWindowResize action =
                            action runAlgebra' st dims
 
                pure (ConstructedSnippet mempty mempty pos pos (finishEventHandler finish) finish))
+
+class TightropeImpl impl => TightropeEventImpl impl where
+    type MouseEventImpl impl :: *
+    type KeyboardEventImpl impl :: *
+    type ClipboardEventImpl impl :: *
+    type EventImpl impl :: *
+
+    click, dblClick, mouseUp, mouseDown, mouseEnter, mouseLeave, mouseOver,
+      mouseOut, mouseMove, contextMenu :: Event impl (MouseEventImpl impl)
+    keyDown, keyUp, keyPress :: Event impl (KeyboardEventImpl impl)
+    drag, drop, dragStart, dragEnd, dragEnter, dragLeave, dragOver :: Event impl (MouseEventImpl impl)
+    cutEvent, copyEvent, pasteEvent :: Event impl (ClipboardEventImpl impl)
+    change, focusEvent, blurEvent :: Event impl (EventImpl impl)
+
+instance TightropeEventImpl DummyImpl where
+    type MouseEventImpl DummyImpl = ()
+    type KeyboardEventImpl DummyImpl = ()
+    type ClipboardEventImpl DummyImpl = ()
+    type EventImpl DummyImpl = ()
+
+    dblClick    = DummyEvent
+    click       = DummyEvent
+
+    keyDown     = DummyEvent
+    keyUp       = DummyEvent
+    keyPress    = DummyEvent
+
+    mouseUp     = DummyEvent
+    mouseDown   = DummyEvent
+    mouseEnter  = DummyEvent
+    mouseLeave  = DummyEvent
+    mouseOver   = DummyEvent
+    mouseOut    = DummyEvent
+    mouseMove   = DummyEvent
+    contextMenu = DummyEvent
+
+    drag        = DummyEvent
+    drop        = DummyEvent
+    dragStart   = DummyEvent
+    dragEnd     = DummyEvent
+    dragEnter   = DummyEvent
+    dragLeave   = DummyEvent
+    dragOver    = DummyEvent
+
+    cutEvent    = DummyEvent
+    copyEvent   = DummyEvent
+    pasteEvent  = DummyEvent
+
+    focusEvent  = DummyEvent
+    blurEvent   = DummyEvent
+    change      = DummyEvent
+

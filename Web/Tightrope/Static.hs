@@ -11,12 +11,15 @@ module Web.Tightrope.Static
     , Snippet, Attribute
     , Component, Node
 
+    , TT.TightropeEventImpl(..)
+
     , renderSnippetStatic
     , mountComponent
     , freezeNode ) where
 
 import Web.Tightrope.Types hiding (Node)
 import qualified Web.Tightrope.Types as TT
+import qualified Web.Tightrope.Event as TT
 
 import Control.Monad
 import Control.Monad.IO.Class
@@ -102,7 +105,7 @@ instance TightropeImpl StaticImpl where
     setStyle _ node key value = do
         tg <- readIORef (nodeTagName node)
         classes <- readIORef (nodeClasses node)
-        putStrLn ("Set Style " <> show tg <> " " <> show classes <> " " <> show value)
+
         modifyIORef' (nodeStyle node) $ \styles ->
           case value of
             Nothing -> M.delete key styles
@@ -113,11 +116,48 @@ instance TightropeImpl StaticImpl where
 
     requestFrame _ redraw = redraw 0
 
+instance TT.TightropeEventImpl StaticImpl where
+    type MouseEventImpl StaticImpl = ()
+    type KeyboardEventImpl StaticImpl = ()
+    type ClipboardEventImpl StaticImpl = ()
+    type EventImpl StaticImpl = ()
+
+    dblClick    = StaticEvent
+    click       = StaticEvent
+
+    keyDown     = StaticEvent
+    keyUp       = StaticEvent
+    keyPress    = StaticEvent
+
+    mouseUp     = StaticEvent
+    mouseDown   = StaticEvent
+    mouseEnter  = StaticEvent
+    mouseLeave  = StaticEvent
+    mouseOver   = StaticEvent
+    mouseOut    = StaticEvent
+    mouseMove   = StaticEvent
+    contextMenu = StaticEvent
+
+    drag        = StaticEvent
+    drop        = StaticEvent
+    dragStart   = StaticEvent
+    dragEnd     = StaticEvent
+    dragEnter   = StaticEvent
+    dragLeave   = StaticEvent
+    dragOver    = StaticEvent
+
+    cutEvent    = StaticEvent
+    copyEvent   = StaticEvent
+    pasteEvent  = StaticEvent
+
+    focusEvent  = StaticEvent
+    blurEvent   = StaticEvent
+    change      = StaticEvent
+
 -- * Node implementation
 
 newNode, newTextNode :: T.Text -> IO IONode
 newNode tagName =
-    putStrLn ("Create tag " <> show tagName) >> (
     StaticNode
     <$> newIORef Nothing
     <*> newIORef Nothing
@@ -127,7 +167,7 @@ newNode tagName =
     <*> newIORef tagName
     <*> newIORef mempty
     <*> newIORef mempty
-    <*> newIORef mempty)
+    <*> newIORef mempty
 
 newTextNode content =
     StaticText

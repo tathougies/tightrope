@@ -7,49 +7,40 @@ module Web.Tightrope.JS
     , Snippet, Attribute, Component
     , Node
 
+    , TT.TightropeEventImpl(..)
+
     , jss
     , addStylesheet
 
     , mountComponent
 
-    , click, dblClick
-    , keyDown, keyUp, keyPress
+    , customHandler
 
-    , change
+    , withDOMImpl ) where
 
-    , mouseUp, mouseDown, mouseEnter, mouseLeave
-    , mouseOver, mouseOut, mouseMove, contextMenu
+import           Prelude hiding (drop)
 
-    , drag, drop
-    , dragStart, dragEnd
-    , dragEnter, dragLeave, dragOver
-
-    , cutEvent, copyEvent, pasteEvent
-
-    , blurEvent, focusEvent
-
-    , customHandler ) where
-
-import Prelude hiding (drop)
-
-import Web.Tightrope.Types hiding (Node)
+import           Web.Tightrope.Types hiding (Node)
 import qualified Web.Tightrope.Types as TT
-import Web.Tightrope.Attributes
+import qualified Web.Tightrope.Event as TT
+import           Web.Tightrope.Attributes
 
-import Control.Concurrent.MVar
-import Control.Exception (bracket)
-import Control.Monad
-import Control.Monad.Reader
+import           Control.Concurrent.MVar
+import           Control.Exception (bracket)
+import           Control.Monad
+import           Control.Monad.Reader
 
-import Data.JSString (JSString)
+import           Data.Coerce
+import           Data.IORef
+import           Data.JSString (JSString)
 import qualified Data.JSString as JSS
 import qualified Data.JSString.Text as JSS
-import Data.IORef
-import Data.Monoid
-import Data.Coerce
+import           Data.Monoid
+import           Data.Typeable
 
 import qualified GHCJS.DOM as DOM
 import qualified GHCJS.DOM.Element as DOM hiding (drop, error)
+import qualified GHCJS.DOM.ElementCSSInlineStyle as DOM
 import qualified GHCJS.DOM.Node as DOM
 import qualified GHCJS.DOM.Text as DOM
 import qualified GHCJS.DOM.Document as DOM hiding (drop, evaluate, error)
@@ -61,14 +52,15 @@ import qualified GHCJS.DOM.EventM as DOM
 import qualified GHCJS.DOM.Event as DOM
 import qualified GHCJS.DOM.NodeList as DOM (getLength, item)
 import qualified GHCJS.DOM.Window as DOM hiding (drop, getLength, error)
+import qualified GHCJS.DOM.GlobalEventHandlers as DOM (resize)
 import qualified GHCJS.DOM.RequestAnimationFrameCallback as DOM
 import qualified GHCJS.DOM.DOMTokenList as TokenList
-import GHCJS.DOM.CSSStyleDeclaration as DOM hiding (getLength, item)
+import           GHCJS.DOM.CSSStyleDeclaration as DOM hiding (getLength, item)
 import qualified GHCJS.Foreign.Callback as DOM
 import qualified GHCJS.Types as DOM
 
-import System.Mem.StableName
-import System.IO.Unsafe
+import           System.Mem.StableName
+import           System.IO.Unsafe
 
 data DOMImpl
 
@@ -80,11 +72,11 @@ instance TightropeImpl DOMImpl where
 
     createElement _ tagName =
         do Just document <- DOM.currentDocument
-           Just el <- DOM.createElement document (Just tagName)
+           el <- DOM.createElement document tagName
            pure (DOM.toNode el)
     createTextNode _ txt =
         do Just document <- DOM.currentDocument
-           Just t <- DOM.createTextNode document txt
+           t <- DOM.createTextNode document txt
            pure (DOM.toNode t)
 
     addEventListener n (Event evtName :: Event DOMImpl e) action =
@@ -113,26 +105,25 @@ instance TightropeImpl DOMImpl where
 
     insertAtPos _ (DOMInsertPos parent Nothing) child =
         do children <- DOM.getChildNodes parent
-           childCount <- maybe (pure 0) DOM.getLength children
-           case (children, childCount) of
-             (_, 0)       -> DOM.appendChild parent (Just child)
-             (Nothing, _) -> DOM.appendChild parent (Just child)
-             (Just children, _) ->
-                 do Just firstChild <- DOM.item children 0
-                    DOM.insertBefore parent (Just child) (Just firstChild)
+           childCount <- DOM.getLength children
+           if childCount == 0
+             then DOM.appendChild parent child
+             else do
+               firstChild <- DOM.item children 0
+               DOM.insertBefore parent child firstChild
            pure (DOMInsertPos parent (Just child))
     insertAtPos _ (DOMInsertPos parent (Just prevSibling)) child =
         do nextSibling <- DOM.getNextSibling prevSibling
            case nextSibling of
-             Nothing  -> DOM.appendChild parent (Just child)
-             Just sib -> DOM.insertBefore parent (Just child) (Just sib)
+             Nothing  -> DOM.appendChild parent child
+             Just sib -> DOM.insertBefore parent child (Just sib)
            pure (DOMInsertPos parent (Just child))
     removeChild _ n =
         do parent <- DOM.getParentNode n
            case parent of
              Nothing -> pure ()
              Just parent -> do
-               DOM.removeChild parent (Just n)
+               DOM.removeChild parent n
                pure ()
 
     addClasses p node classes =
@@ -140,14 +131,10 @@ instance TightropeImpl DOMImpl where
         in mapM_ (enableClass p node) classList
     enableClass _ node className =
         do classes <- DOM.getClassList (DOM.uncheckedCastTo DOM.Element node)
-           case classes of
-             Just classes -> TokenList.add classes [className]
-             _ -> pure ()
+           TokenList.add classes [className]
     disableClass _ node className =
         do classes <- DOM.getClassList (DOM.uncheckedCastTo DOM.Element node)
-           case classes of
-             Just classes -> TokenList.remove classes [className]
-             _ -> pure ()
+           TokenList.remove classes [className]
 
     setAttribute _ n "class" Nothing = pure ()
     setAttribute _ n "class" (Just v) =
@@ -175,12 +162,12 @@ instance TightropeImpl DOMImpl where
           _ -> pure ()
 
     setStyle _ n key Nothing =
-        do Just style <- DOM.getStyle (DOM.uncheckedCastTo DOM.Element n)
-           DOM.removeProperty style key :: IO (Maybe JSString)
+        do style <- DOM.getStyle (DOM.uncheckedCastTo DOM.ElementCSSInlineStyle n)
+           DOM.removeProperty style key :: IO JSString
            pure ()
     setStyle _ n key (Just value) =
-        do Just style <- DOM.getStyle (DOM.uncheckedCastTo DOM.Element n)
-           DOM.setProperty style key (Just value) (JSS.pack "")
+        do style <- DOM.getStyle (DOM.uncheckedCastTo DOM.ElementCSSInlineStyle n)
+           DOM.setProperty style key value (Just (JSS.pack ""))
            pure ()
 
     setNodeValue _ n value =
@@ -210,12 +197,12 @@ addStylesheet loc =
     do Just document <- DOM.currentDocument
        Just head <- DOM.getHead document
 
-       Just link <- DOM.createElement document (Just "link" :: Maybe JSString)
+       link <- DOM.createElement document ("link" :: JSString)
        DOM.setAttribute link ("rel" :: JSString) ("stylesheet" :: JSString)
        DOM.setAttribute link ("type" :: JSString) ("text/css" :: JSString)
        DOM.setAttribute link ("href" :: JSString) loc
 
-       DOM.appendChild head (Just link)
+       DOM.appendChild head link
        pure ()
 
 -- * Top-level component attachment
@@ -232,15 +219,15 @@ requestAnimationFrameHs doDraw = do
 
        cb' <-
            case cb of
-             Just _ -> pure cb
-             Nothing -> Just <$> DOM.newRequestAnimationFrameCallbackAsync _doRedraw
+             Just cb -> pure cb
+             Nothing -> DOM.newRequestAnimationFrameCallbackAsync _doRedraw
        existing' <-
            case existing of
              Just _ -> pure existing
              Nothing -> do
                Just window <- DOM.currentWindow
                Just <$> DOM.requestAnimationFrame window cb'
-       pure (reqs' `seq` (cb', existing', reqs'))
+       pure (reqs' `seq` (Just cb', existing', reqs'))
 
   where
     _doRedraw ts =
@@ -317,43 +304,43 @@ mountComponent el initialProps (Component mkSt emptyOut runAlgebra onCreate onPr
 
 -- * Events
 
-dblClick, click :: Event DOMImpl DOM.MouseEvent
-dblClick = Event "dblclick"
-click = Event "click"
+instance TT.TightropeEventImpl DOMImpl where
+    type MouseEventImpl DOMImpl = DOM.MouseEvent
+    type KeyboardEventImpl DOMImpl = DOM.KeyboardEvent
+    type ClipboardEventImpl DOMImpl = DOM.ClipboardEvent
+    type EventImpl DOMImpl = DOM.Event
 
-keyDown, keyUp, keyPress :: Event DOMImpl DOM.KeyboardEvent
-keyDown = Event "keydown"
-keyUp = Event "keyup"
-keyPress = Event "keypress"
+    dblClick = Event "dblclick"
+    click = Event "click"
 
-mouseUp, mouseDown, mouseEnter, mouseLeave, mouseOver, mouseOut, mouseMove, contextMenu :: Event DOMImpl DOM.MouseEvent
-mouseUp = Event "mouseup"
-mouseDown = Event "mousedown"
-mouseEnter = Event "mouseenter"
-mouseLeave = Event "mouseleave"
-mouseOver = Event "mouseover"
-mouseOut = Event "mouseout"
-mouseMove = Event "mousemove"
-contextMenu = Event "contextmenu"
+    keyDown = Event "keydown"
+    keyUp = Event "keyup"
+    keyPress = Event "keypress"
 
-drag, drop, dragStart, dragEnd, dragEnter, dragLeave, dragOver :: Event DOMImpl DOM.MouseEvent
-drag = Event "drag"
-drop = Event "drop"
-dragStart = Event "dragstart"
-dragEnd = Event "dragend"
-dragEnter = Event "dragenter"
-dragLeave = Event "dragleave"
-dragOver = Event "dragover"
+    mouseUp = Event "mouseup"
+    mouseDown = Event "mousedown"
+    mouseEnter = Event "mouseenter"
+    mouseLeave = Event "mouseleave"
+    mouseOver = Event "mouseover"
+    mouseOut = Event "mouseout"
+    mouseMove = Event "mousemove"
+    contextMenu = Event "contextmenu"
 
-cutEvent, copyEvent, pasteEvent :: Event DOMImpl DOM.Event
-cutEvent = Event "cut"
-copyEvent = Event "copy"
-pasteEvent = Event "paste"
+    drag = Event "drag"
+    drop = Event "drop"
+    dragStart = Event "dragstart"
+    dragEnd = Event "dragend"
+    dragEnter = Event "dragenter"
+    dragLeave = Event "dragleave"
+    dragOver = Event "dragover"
 
-change, focusEvent, blurEvent :: Event DOMImpl DOM.Event
-focusEvent = Event "focus"
-blurEvent = Event "blur"
-change = Event "change"
+    cutEvent = Event "cut"
+    copyEvent = Event "copy"
+    pasteEvent = Event "paste"
+
+    focusEvent = Event "focus"
+    blurEvent = Event "blur"
+    change = Event "change"
 
 -- * Custom events
 
@@ -377,3 +364,7 @@ customHandler attachHandler detachHandler handler =
   where
     go finish = Snippet $ \_ _ _ pos ->
                 pure (ConstructedSnippet mempty mempty pos pos (go finish) finish)
+
+withDOMImpl :: TightropeImpl impl => Proxy impl -> a -> ((impl :~: DOMImpl) -> a) -> a
+withDOMImpl Proxy otherwise action =
+    maybe otherwise action eqT

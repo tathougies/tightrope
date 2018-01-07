@@ -2,28 +2,33 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE CPP #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 
 module Web.Tightrope.Types where
 
-import Control.Concurrent.MVar
-import Control.Monad.IO.Class
-import Control.Monad.Reader
-import Control.Monad.State
-import Control.Applicative
-import Control.Lens
+import           Control.Applicative
+import           Control.Concurrent.MVar
+import           Control.Exception (evaluate)
+import           Control.Lens
+import           Control.Monad.IO.Class
+import           Control.Monad.Identity
+import           Control.Monad.Reader
+import           Control.Monad.State
 
+import           Data.IORef
+import           Data.Int
+import           Data.Monoid
+import           Data.Proxy
+import           Data.String
 import qualified Data.Text as T
-import Data.Monoid
-import Data.IORef
-import Data.Proxy
-import Data.String
-import Data.Typeable
+import           Data.Typeable
+import           Data.Word
 #ifdef __GHCJS__
-import Data.JSString (JSString)
-import Data.JSString.Text (textToJSString, textFromJSString)
+import           Data.JSString (JSString)
+import           Data.JSString.Text (textToJSString, textFromJSString)
 #endif
 
-import System.Mem.StableName
+import           System.Mem.StableName
 
 class IsText t where
     fromText :: T.Text -> t
@@ -31,6 +36,11 @@ class IsText t where
 instance IsText T.Text where
     fromText = id
     toText = id
+
+class AttrValue x where
+    type AttrValueState x :: *
+
+    attrValue :: TightropeImpl impl => Proxy impl -> Text impl -> x -> (AttrValueState x, Maybe (Text impl))
 
 #ifdef __GHCJS__
 instance IsText JSString where
@@ -56,6 +66,7 @@ class ( Monoid (Text impl), Eq (Text impl)
 #ifdef __GHCJS__
       , IsJSS (Text impl)
 #endif
+      , AttrValue (Text impl)
       , Typeable impl) => TightropeImpl impl where
     type Node impl  :: *
     type Text impl  :: *
@@ -108,12 +119,12 @@ data ConstructedSnippet impl out state algebra
     , constructedSnippetNext :: Snippet' impl out state algebra
     , constructedSnippetFinish :: IO () }
 
-newtype Attribute' impl out st algebra = Attribute (Snippet' impl out st algebra)
+newtype Attribute' impl out st algebra = Attribute (Snippet' impl out st algebra) deriving Monoid
 
 type GenericSnippet = forall impl st out algebra. TightropeImpl impl => Snippet' impl st out algebra
 
 data Component' impl props (algebra :: * -> *) (parentAlgebra :: * -> *) where
-    Component :: MonadIO parentAlgebra =>
+    Component :: (MonadIO parentAlgebra, Typeable state, Typeable out) =>
                  { componentInitState     :: props -> state
                  , componentEmptyOut      :: out
                  , componentRunAlgebra    :: forall a. EnterExit state out parentAlgebra algebra -> state -> out -> algebra a -> IO (a, state)
@@ -142,6 +153,24 @@ data Embedded index parent current
 instance Monoid (AfterAction out) where
     mempty = AfterAction []
     mappend (AfterAction a) (AfterAction b) = AfterAction (a <> b)
+
+parent_ :: Lens (Embedded idx parent child) (Embedded idx parent' child) parent parent'
+parent_ = lens get set
+    where get (Embedded parent _ _) = parent
+          set (Embedded _ child idx) parent = Embedded parent child idx
+
+current_ :: Lens (Embedded idx parent child) (Embedded idx parent child') child child'
+current_ = lens get set
+    where get (Embedded _ child _) = child
+          set (Embedded parent _ idx) child = Embedded parent child idx
+
+index_ :: Lens (Embedded idx parent child) (Embedded idx' parent child) idx idx'
+index_ = lens get set
+    where get (Embedded _ _ idx) = idx
+          set (Embedded parent child _) idx = Embedded parent child idx
+
+set_ :: Setter' s (Maybe a) -> a -> s -> s
+set_ loc val = loc ?~ val
 
 runAfterAction :: AfterAction out -> out -> IO ()
 runAfterAction act out = go' act out
@@ -224,7 +253,7 @@ data DummyImpl
 instance TightropeImpl DummyImpl where
     type Node DummyImpl = ()
     type Text DummyImpl = T.Text
-    data Event DummyImpl e
+    data Event DummyImpl e = DummyEvent
 
     createElement _ _ = pure ()
     createTextNode _ _ = pure ()
@@ -249,6 +278,9 @@ instance TightropeImpl DummyImpl where
 (~~~) :: (MonadState s m, MonadIO m) => Lens' s v -> v -> m ()
 lens ~~~ v =
     do oldVal <- use lens
+       (oldVal, v) <- liftIO ((,) <$> evaluate oldVal
+                                  <*> evaluate v)
+
        oldNm <- liftIO (makeStableName oldVal)
        newNm <- liftIO (makeStableName v)
        if oldNm /= newNm
@@ -262,3 +294,59 @@ lens ~==~ v =
           then modify (lens .~ v)
           else pure ()
 infixr 4 ~~~, ~==~
+
+-- * AttrValue instances
+
+instance AttrValue x => AttrValue (Maybe x) where
+    type AttrValueState (Maybe x) = Maybe (AttrValueState x)
+
+    attrValue _ _ Nothing = (Nothing, Nothing)
+    attrValue p nm (Just x) =
+        let (x', v) = attrValue p nm x
+        in (Just x', v)
+
+instance AttrValue String where
+    type AttrValueState String = String
+
+    attrValue _ _ x = (x, Just . fromString $ x)
+
+instance AttrValue T.Text where
+    type AttrValueState T.Text = T.Text
+
+    attrValue _ _ x = (x, Just . fromText $ x)
+
+instance AttrValue Word where
+    type AttrValueState Word = Word
+
+    attrValue _ _ x = (x, Just . fromString . show $ x)
+
+instance AttrValue Int where
+    type AttrValueState Int = Int
+
+    attrValue _ _ x = (x, Just . fromString . show $ x)
+
+instance AttrValue Integer where
+    type AttrValueState Integer = Integer
+
+    attrValue _ _ x = (x, Just . fromString . show $ x)
+
+instance AttrValue Double where
+    type AttrValueState Double = Double
+
+    attrValue _ _ x = (x, Just . fromString . show $ x)
+
+instance AttrValue Float where
+    type AttrValueState Float = Float
+
+    attrValue _ _ x = (x, Just . fromString . show $ x)
+
+instance AttrValue Bool where
+    type AttrValueState Bool = Bool
+
+    attrValue _ _ False = (False, Nothing)
+    attrValue _ name True = (True, Just name)
+
+instance AttrValue x => AttrValue (Identity x) where
+    type AttrValueState (Identity x) = AttrValueState x
+
+    attrValue impl nm (Identity v) = attrValue impl nm v

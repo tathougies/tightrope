@@ -1,13 +1,16 @@
 module Web.Tightrope.Combinators where
 
-import Web.Tightrope.Types
+import           Web.Tightrope.Types
 
-import Control.Monad (forM_)
+import           Control.Monad (forM_)
+import           Control.Monad.Reader
+import           Control.Lens (Fold, (^?))
 
-import Data.Monoid
-import Data.Maybe
-import Data.DList (DList)
+import           Data.DList (DList)
 import qualified Data.DList as D
+import           Data.IORef
+import           Data.Maybe
+import           Data.Monoid
 
 infixl 1 |-, |+
 
@@ -189,7 +192,26 @@ cond_ cond template =
     guarded_ (\s -> if cond s then Just s else Nothing)
              (project_ (\(Embedded _ s _) -> s) template)
 
-choice_ :: forall impl a b state out algebra parentAlgebra.
+data Choice impl out state algebra where
+    Choice :: Fold state state'
+           -> Snippet' impl out (Embedded () state state') algebra
+           -> Choice impl out state algebra
+
+(-->) :: Fold state state'
+      -> Snippet' impl out (Embedded () state state') algebra
+      -> Choice impl out state algebra
+(-->) = Choice
+
+choices_ :: forall impl state out algebra
+          . [ Choice impl out state algebra ]
+         -> Snippet' impl out state algebra
+choices_ = foldr (\(Choice prism snippet) ->
+                      choice_ (\s -> case s ^? prism of
+                                       Just x -> Left x
+                                       Nothing -> Right ()) snippet .
+                      project_ parent) mempty
+
+choice_ :: forall impl a b state out algebra.
            (state -> Either a b)
         -> Snippet' impl out (Embedded () state a) algebra
         -> Snippet' impl out (Embedded () state b) algebra
@@ -457,3 +479,28 @@ enum_ mkBounds (Snippet create) = go (toEnum 1) (toEnum 0) []
 --                      (ConstructedSnippet (mkOut <> itemMkOut) (scheduled <> itemScheduled)
 --                                          siblingPos' childPos'
 --                                          (a . (itemIntSt' :)))
+
+state_ :: forall impl out state state' algebra
+        . (state -> state')
+       -> Snippet' impl out state (ReaderT state' algebra)
+       -> Snippet' impl out state algebra
+state_ mkSubState (Snippet el) =
+    Snippet (\runAlgebra st getSt pos -> do
+               ref <- newIORef (mkSubState st)
+               ConstructedSnippet out after sibling child next finish <-
+                   el (runAlgebra' ref runAlgebra) st getSt pos
+               pure (ConstructedSnippet out after sibling child
+                                        (go ref next) finish))
+  where
+    go ref (Snippet next) =
+      Snippet (\runAlgebra st getSt pos -> do
+                 ConstructedSnippet out after sibling child next' finish <-
+                     next (runAlgebra' ref runAlgebra) st getSt pos
+                 pure (ConstructedSnippet out after sibling child
+                                          (go ref next') finish))
+
+    runAlgebra' :: forall a. IORef state' -> RunAlgebra algebra
+                -> ReaderT state' algebra a -> IO a
+    runAlgebra' ref run act = do
+      x <- readIORef ref
+      run (runReaderT act x)
