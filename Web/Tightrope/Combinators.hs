@@ -11,6 +11,9 @@ import qualified Data.DList as D
 import           Data.IORef
 import           Data.Maybe
 import           Data.Monoid
+import           Data.String
+
+import           System.Random
 
 infixl 1 |-, |+
 
@@ -504,3 +507,29 @@ state_ mkSubState (Snippet el) =
     runAlgebra' ref run act = do
       x <- readIORef ref
       run (runReaderT act x)
+
+withUniqueName_ :: IsString (Text impl)
+                => Snippet' impl out (Embedded () state (Text impl)) algebra
+                -> Snippet' impl out state algebra
+withUniqueName_ (Snippet el) =
+    Snippet (\runAlgebra st getSt pos -> do
+               name <- newName
+
+               ConstructedSnippet out after sibling child next finish <-
+                   el runAlgebra (Embedded st name ()) (fmap (\st -> Embedded st name ()) getSt) pos
+
+               pure (ConstructedSnippet out after sibling child
+                                        (go name next) finish))
+
+    where
+      go name (Snippet next) =
+          Snippet (\runAlgebra st getSt pos -> do
+                     ConstructedSnippet out after sibling child next finish <-
+                         next runAlgebra (Embedded st name ()) (fmap (\st -> Embedded st name ()) getSt) pos
+
+                     pure (ConstructedSnippet out after sibling child
+                                              (go name next) finish))
+
+      newName = fmap fromString $
+                replicateM 32   $
+                randomRIO ('A', 'z')
