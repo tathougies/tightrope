@@ -1,3 +1,5 @@
+{-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE TypeSynonymInstances #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE OverloadedStrings #-}
@@ -9,15 +11,20 @@ module Web.Tightrope.Static
     , IONode, FrozenNode
 
     , Snippet, Attribute
-    , Component, Node
+    , Component
+    , Node, RunAlgebra, EnterExit, EnterExitT
+    , GenericRunAlgebra, EmbeddedAlgebraWrapper
 
     , TT.TightropeEventImpl(..)
 
     , renderSnippetStatic
     , mountComponent
-    , freezeNode ) where
+    , freezeNode
+    , liftDom ) where
 
-import Web.Tightrope.Types hiding (Node)
+import Web.Tightrope.Types hiding ( Node, RunAlgebra, EnterExit, EnterExitT
+                                  , GenericRunAlgebra, EmbeddedAlgebraWrapper
+                                  , liftDom )
 import qualified Web.Tightrope.Types as TT
 import qualified Web.Tightrope.Event as TT
 
@@ -30,10 +37,14 @@ import Control.Exception (bracketOnError)
 import qualified Data.HashSet as S
 import qualified Data.HashMap.Strict as M
 import qualified Data.Text as T
+import Data.Proxy
 import Data.Monoid
 import Data.IORef
 
 data StaticImpl
+
+liftDom :: MonadDom StaticImpl m => IO a -> m a
+liftDom = TT.liftDom (Proxy @StaticImpl)
 
 data StaticNode ref
     = StaticNode
@@ -63,13 +74,24 @@ type Snippet = Snippet' StaticImpl
 type Attribute = Attribute' StaticImpl
 type Component = Component' StaticImpl
 type Node = TT.Node StaticImpl
+type RunAlgebra x = TT.RunAlgebra StaticImpl x
+type GenericRunAlgebra x = TT.GenericRunAlgebra StaticImpl x
+type EmbeddedAlgebraWrapper = TT.EmbeddedAlgebraWrapper StaticImpl
+type EnterExit = TT.EnterExit StaticImpl
+type EnterExitT = TT.EnterExitT StaticImpl
 
 -- * Instance for TightropeImpl
+
+instance MonadDom StaticImpl IO where
+    liftDom _ = id
 
 instance TightropeImpl StaticImpl where
     type Node StaticImpl = IONode
     type Text StaticImpl = T.Text
     data Event StaticImpl e = StaticEvent
+    type DomM StaticImpl = IO
+
+    getIORunner = pure (IORunner id)
 
     createElement _ = newNode
     createTextNode _ = newTextNode
@@ -255,7 +277,7 @@ mountComponent initialProps (Component mkSt emptyOut runAlgebra onCreate onProps
            (x, scheduled, out) <-
              bracketOnError (takeMVar stVar) (putMVar stVar) $ \st ->
                  bracketOnError (takeMVar intStVar) (putMVar intStVar) $ \(out, Snippet updateTemplate, finishTemplate) -> do
-                   (x, st') <- runAlgebra (EnterExit (putMVar stVar) (takeMVar stVar) id runAlgebra') st out a
+                   (x, st') <- runAlgebra (TT.EnterExit (putMVar stVar) (takeMVar stVar) id runAlgebra') st out a
 
                    ConstructedSnippet (Endo mkOut) scheduled _ _ updateTemplate' finishTemplate' <-
                      updateTemplate runAlgebra' st getSt (DOMInsertPos rootNode Nothing)

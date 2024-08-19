@@ -10,7 +10,8 @@ import qualified Data.Text as T
 
 import Web.Tightrope.Types
 
-constNodeSnippet :: Node impl -> IO ()
+constNodeSnippet :: Applicative (DomM impl)
+                 => Node impl -> DomM impl ()
                  -> Snippet' impl st out algebra
 constNodeSnippet n finish =
     let x = Snippet $ \_ _ _ (DOMInsertPos parent _) ->

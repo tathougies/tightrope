@@ -58,7 +58,8 @@ parent |+ Attribute attr = parent |- attr
 
 -- * Projections
 
-project_ :: (st -> st')
+project_ :: Monad (DomM impl)
+         => (st -> st')
          -> Snippet' impl out st' algebra
          -> Snippet' impl out st  algebra
 project_ f (Snippet create) =
@@ -68,8 +69,9 @@ project_ f (Snippet create) =
 
 -- -- * Keyed updates
 
-keyedUpdates_ :: forall impl key state out algebra.
-                 Eq key => (state -> key)
+keyedUpdates_ :: forall impl key state out algebra
+               . (Monad (DomM impl), Eq key)
+              => (state -> key)
               -> Snippet' impl out state algebra
               -> Snippet' impl out state algebra
 keyedUpdates_ mkKey (Snippet create) =
@@ -112,8 +114,9 @@ keyedUpdates_ mkKey (Snippet create) =
 
 -- * Captures
 
-captured_ :: forall impl state out algebra.
-             (state -> Node impl -> out -> out)
+captured_ :: forall impl state out algebra
+           . (Monad (DomM impl))
+          => (state -> Node impl -> out -> out)
           -> Snippet' impl out state algebra
           -> Snippet' impl out state algebra
 captured_ modOut (Snippet snippet) =
@@ -126,8 +129,9 @@ captured_ modOut (Snippet snippet) =
 
 -- -- * Switch
 
-switch_ :: forall key impl state out algebra.
-           Eq key => (state -> key)
+switch_ :: forall key impl state out algebra
+         . (Monad (DomM impl), Eq key)
+        => (state -> key)
         -> (key -> Snippet' impl out state algebra)
         -> Snippet' impl out state algebra
 switch_ mkKey mkComponent =
@@ -162,7 +166,7 @@ switch_ mkKey mkComponent =
 --                     create' runAlgebra st getSt pos
 --                   let intSt' = RenderedSnippet intSt update' finish'
 --                   pure (ConstructedSnippet mkOut after siblingPos childPos
---                                            (initialKey :++ intSt'))
+--                                            (Initialke :++ intSt'))
 
 --     update :: RunAlgebra algebra -> state -> IO state
 --            -> SnippetUpdater impl (key :++ RenderedSnippet impl out state algebra) out
@@ -189,7 +193,8 @@ switch_ mkKey mkComponent =
 
 -- * Conditionals
 
-cond_ :: (state -> Bool) -> Snippet' impl out state algebra
+cond_ :: Monad (DomM impl)
+      => (state -> Bool) -> Snippet' impl out state algebra
       -> Snippet' impl out state algebra
 cond_ cond template =
     guarded_ (\s -> if cond s then Just s else Nothing)
@@ -206,7 +211,8 @@ data Choice impl out state algebra where
 (-->) = Choice
 
 choices_ :: forall impl state out algebra
-          . [ Choice impl out state algebra ]
+          . Monad (DomM impl)
+         => [ Choice impl out state algebra ]
          -> Snippet' impl out state algebra
 choices_ = foldr (\(Choice prism snippet) ->
                       choice_ (\s -> case s ^? prism of
@@ -214,8 +220,9 @@ choices_ = foldr (\(Choice prism snippet) ->
                                        Nothing -> Right ()) snippet .
                       project_ parent) mempty
 
-choice_ :: forall impl a b state out algebra.
-           (state -> Either a b)
+choice_ :: forall impl a b state out algebra
+         . Monad (DomM impl)
+        => (state -> Either a b)
         -> Snippet' impl out (Embedded () state a) algebra
         -> Snippet' impl out (Embedded () state b) algebra
         -> Snippet' impl out state algebra
@@ -244,7 +251,8 @@ choice_ mkKey aSnippet bSnippet = go aSnippet bSnippet (pure ()) (pure ())
       let Right bSt = mkKey st
       pure (Embedded st bSt ())
 
-if_ :: (st -> Bool)
+if_ :: Monad (DomM impl)
+    => (st -> Bool)
     -> Snippet' impl out st algebra
     -> Snippet' impl out st algebra
     -> Snippet' impl out st algebra
@@ -253,8 +261,9 @@ if_ cond true_ false_ =
             (project_ parent true_)
             (project_ parent false_)
 
-guarded_ :: forall impl st st' out algebra.
-            (st -> Maybe st')
+guarded_ :: forall impl st st' out algebra
+          . (Monad (DomM impl))
+         => (st -> Maybe st')
          -> Snippet' impl out (Embedded () st st') algebra
          -> Snippet' impl out st algebra
 guarded_ check =
@@ -265,8 +274,9 @@ guarded_ check =
 
 -- -- * Repetitions
 
-repeat_ :: forall impl current state out algebra.
-           (state -> [current])
+repeat_ :: forall impl current state out algebra
+         . Monad (DomM impl)
+        => (state -> [current])
         -> Snippet' impl out (Embedded Int state current) algebra
         -> Snippet' impl out state algebra
 repeat_ mkCurrent (Snippet createItem) = go []
@@ -286,13 +296,13 @@ repeat_ mkCurrent (Snippet createItem) = go []
            let oldSts''' = D.toList oldSts''
            pure (ConstructedSnippet mkOut scheduled siblingPos' childPos' (go oldSts''') (mapM_ snd oldSts'''))
 
-    createAll :: RunAlgebra algebra -> state -> IO state -> Int -> [current]
+    createAll :: RunAlgebra impl algebra -> state -> DomM impl state -> Int -> [current]
 
-              -> ( Endo out, AfterAction out, DOMInsertPos impl, DOMInsertPos impl
-                 , DList (Snippet' impl out (Embedded Int state current) algebra, IO ()) )
+              -> ( Endo out, AfterAction impl out, DOMInsertPos impl, DOMInsertPos impl
+                 , DList (Snippet' impl out (Embedded Int state current) algebra, DomM impl ()) )
 
-              -> IO ( Endo out, AfterAction out, DOMInsertPos impl, DOMInsertPos impl
-                    , DList (Snippet' impl out (Embedded Int state current) algebra, IO ()) )
+              -> DomM impl ( Endo out, AfterAction impl out, DOMInsertPos impl, DOMInsertPos impl
+                           , DList (Snippet' impl out (Embedded Int state current) algebra, DomM impl ()) )
     createAll runAlgebra _ _ !ix [] a = pure a
     createAll runAlgebra state getState !ix (item:items) (mkOut, scheduled, siblingPos', _, a) =
         do ConstructedSnippet itemMkOut itemScheduled siblingPos'' childPos' child' itemFinish <-
@@ -302,14 +312,14 @@ repeat_ mkCurrent (Snippet createItem) = go []
                      ( mkOut <> itemMkOut, scheduled <> itemScheduled, siblingPos''
                      , childPos', a <> pure (child', itemFinish) )
 
-    updateAll :: RunAlgebra algebra -> state -> IO state -> Int
+    updateAll :: RunAlgebra impl algebra -> state -> DomM impl state -> Int
               -> [current] -> [Snippet' impl out (Embedded Int state current) algebra]
 
-              -> ( Endo out, AfterAction out, DOMInsertPos impl, DOMInsertPos impl
-                 , DList (Snippet' impl out (Embedded Int state current) algebra, IO ()) )
+              -> ( Endo out, AfterAction impl out, DOMInsertPos impl, DOMInsertPos impl
+                 , DList (Snippet' impl out (Embedded Int state current) algebra, DomM impl ()) )
 
-              -> IO ( Endo out, AfterAction out, DOMInsertPos impl, DOMInsertPos impl
-                    , DList (Snippet' impl out (Embedded Int state current) algebra, IO ()) )
+              -> DomM impl ( Endo out, AfterAction impl out, DOMInsertPos impl, DOMInsertPos impl
+                           , DList (Snippet' impl out (Embedded Int state current) algebra, DomM impl ()) )
     updateAll _ _ _ _ [] _ a = pure a
     updateAll _ _ _ _ _ [] a = pure a
     updateAll run state getState !ix (current:currents) (Snippet updateItem:remaining)
@@ -321,9 +331,9 @@ repeat_ mkCurrent (Snippet createItem) = go []
                      ( mkOut <> itemMkOut, scheduled <> itemScheduled, siblingPos'
                      , childPos', a <> pure (updateItem', itemFinish) )
 
-enum_ :: forall impl ix state out algebra.
-         (Enum ix, Ord ix, Show ix) =>
-         (state -> (ix, ix))
+enum_ :: forall impl ix state out algebra
+       . (Enum ix, Ord ix, Show ix, Monad (DomM impl))
+      => (state -> (ix, ix))
       -> Snippet' impl out (Embedded ix state ix) algebra
       -> Snippet' impl out state algebra
 enum_ mkBounds (Snippet create) = go (toEnum 1) (toEnum 0) []
@@ -374,12 +384,12 @@ enum_ mkBounds (Snippet create) = go (toEnum 1) (toEnum 0) []
                                     (go newStart newEnd oldSts'')
                                     (mapM_ snd oldSts''))
 
-    createAll :: RunAlgebra algebra -> state -> IO state -> ix -> (ix, ix)
-              -> ( Endo out, AfterAction out, DOMInsertPos impl, DOMInsertPos impl
-                 , DList (Snippet' impl out (Embedded ix state ix) algebra, IO ()))
+    createAll :: RunAlgebra impl algebra -> state -> DomM impl state -> ix -> (ix, ix)
+              -> ( Endo out, AfterAction impl out, DOMInsertPos impl, DOMInsertPos impl
+                 , DList (Snippet' impl out (Embedded ix state ix) algebra, DomM impl ()))
 
-              -> IO ( Endo out, AfterAction out, DOMInsertPos impl, DOMInsertPos impl
-                    , DList (Snippet' impl out (Embedded ix state ix) algebra, IO ()))
+              -> DomM impl ( Endo out, AfterAction impl out, DOMInsertPos impl, DOMInsertPos impl
+                           , DList (Snippet' impl out (Embedded ix state ix) algebra, DomM impl ()))
     createAll run _ _ !ix (start, end) a
         | start > end || ix > end = pure a
     createAll run st getSt ix bounds@(start, end) (mkOut, scheduled, siblingPos, _, a) =
@@ -388,13 +398,13 @@ enum_ mkBounds (Snippet create) = go (toEnum 1) (toEnum 0) []
            createAll run st getSt (succ ix) bounds
                      (mkOut <> itemMkOut, scheduled <> itemScheduled, siblingPos', childPos', a <> pure ((update', finish)))
 
-    updateAll :: RunAlgebra algebra -> state -> IO state -> ix
+    updateAll :: RunAlgebra impl algebra -> state -> DomM impl state -> ix
               -> [ Snippet' impl out (Embedded ix state ix) algebra ]
-              -> ( Endo out, AfterAction out, DOMInsertPos impl, DOMInsertPos impl
-                 , DList (Snippet' impl out (Embedded ix state ix) algebra, IO ()) )
+              -> ( Endo out, AfterAction impl out, DOMInsertPos impl, DOMInsertPos impl
+                 , DList (Snippet' impl out (Embedded ix state ix) algebra, DomM impl ()) )
 
-              -> IO ( Endo out, AfterAction out, DOMInsertPos impl, DOMInsertPos impl
-                    , DList (Snippet' impl out (Embedded ix state ix) algebra, IO ()) )
+              -> DomM impl ( Endo out, AfterAction impl out, DOMInsertPos impl, DOMInsertPos impl
+                           , DList (Snippet' impl out (Embedded ix state ix) algebra, DomM impl ()) )
     updateAll _ _ _ _ [] a = pure a
     updateAll run st getSt ix (Snippet update:items) (mkOut, scheduled, siblingPos, _, a) =
         do ConstructedSnippet itemMkOut itemScheduled siblingPos' childPos' update' finish <-
@@ -484,12 +494,13 @@ enum_ mkBounds (Snippet create) = go (toEnum 1) (toEnum 0) []
 --                                          (a . (itemIntSt' :)))
 
 state_ :: forall impl out state state' algebra
-        . (state -> state')
+        . MonadIO (DomM impl)
+       => (state -> state')
        -> Snippet' impl out state (ReaderT state' algebra)
        -> Snippet' impl out state algebra
 state_ mkSubState (Snippet el) =
     Snippet (\runAlgebra st getSt pos -> do
-               ref <- newIORef (mkSubState st)
+               ref <- liftIO (newIORef (mkSubState st))
                ConstructedSnippet out after sibling child next finish <-
                    el (runAlgebra' ref runAlgebra) st getSt pos
                pure (ConstructedSnippet out after sibling child
@@ -502,13 +513,13 @@ state_ mkSubState (Snippet el) =
                  pure (ConstructedSnippet out after sibling child
                                           (go ref next') finish))
 
-    runAlgebra' :: forall a. IORef state' -> RunAlgebra algebra
-                -> ReaderT state' algebra a -> IO a
+    runAlgebra' :: forall a. IORef state' -> RunAlgebra impl algebra
+                -> ReaderT state' algebra a -> DomM impl a
     runAlgebra' ref run act = do
-      x <- readIORef ref
+      x <- liftIO (readIORef ref)
       run (runReaderT act x)
 
-withUniqueName_ :: IsString (Text impl)
+withUniqueName_ :: (IsString (Text impl), MonadIO (DomM impl))
                 => Snippet' impl out (Embedded () state (Text impl)) algebra
                 -> Snippet' impl out state algebra
 withUniqueName_ (Snippet el) =

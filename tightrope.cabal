@@ -20,13 +20,10 @@ library
                        Web.Tightrope.Static Web.Tightrope.Generic
                        Web.Tightrope.HTML Web.Tightrope.HTML.Attributes
                        Web.Tightrope.Attributes Web.Tightrope.Element
-  if impl(ghcjs)
-    exposed-modules:   Web.Tightrope.JS
+                       Web.Tightrope.JS
   other-extensions:    GADTs
   ghc-options:         -O2 -funbox-strict-fields
-  build-depends:       base >=4.8 && <5.0, mtl, text, unordered-containers, hashable, transformers, lens, dlist, random
-  if impl(ghcjs)
-    build-depends:     ghcjs-base, ghcjs-dom, ghcjs-dom-jsffi
+  build-depends:       base >=4.8 && <5.0, mtl, text, unordered-containers, hashable, transformers, lens, dlist, random, jsaddle, ghcjs-dom, exceptions
   default-language:    Haskell2010
   default-extensions:  RankNTypes, KindSignatures, TypeOperators, TypeFamilies, FlexibleContexts,
                        GADTs, StandaloneDeriving, ScopedTypeVariables, BangPatterns, TupleSections
@@ -36,7 +33,8 @@ executable todomvc
   hs-source-dirs: TodoMVC
   other-extensions: GADTs
   default-language: Haskell2010
+  build-depends:    base >=4.8 && <5.0, mtl >=2.2 && <2.3, ghcjs-dom, tightrope, vector, jsaddle, lens
   if impl(ghcjs)
-    build-depends:    base >=4.8 && <5.0, mtl >=2.2 && <2.3, ghcjs-base, ghcjs-dom, tightrope, vector
+    build-depends: ghcjs-base
   else
-    build-depends:     base >=4.8 && <5.0
+    build-depends:  jsaddle-warp

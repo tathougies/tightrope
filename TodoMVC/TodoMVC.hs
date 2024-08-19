@@ -1,3 +1,4 @@
+{-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE RankNTypes #-}
@@ -6,8 +7,8 @@
 
 module Main where
 
-#ifdef __GHCJS__
-import Web.Tightrope
+import Web.Tightrope.Generic hiding (liftDom)
+import Web.Tightrope.JS
 
 import Control.Monad.State
 import Control.Arrow
@@ -24,22 +25,34 @@ import Data.Monoid
 import Data.String
 import Data.JSString (JSString)
 
-main :: IO ()
-main = do Just document <- currentDocument
-          Just body <- getBody document
+#ifndef __GHCJS__
+import           Language.Javascript.JSaddle hiding (jss)
+import qualified Language.Javascript.JSaddle.Warp as Warp
+#endif
+
+start :: JSM ()
+start = do Just document <- currentDocument
+           Just body <- getBody document
 
 --          setCharset document (Just "utf-8" :: Maybe JSString)
-          addStylesheet "http://todomvc.com/examples/backbone/node_modules/todomvc-common/base.css"
-          addStylesheet "http://todomvc.com/examples/backbone/node_modules/todomvc-app-css/index.css"
+           addStylesheet "http://todomvc.com/examples/backbone/node_modules/todomvc-common/base.css"
+           addStylesheet "http://todomvc.com/examples/backbone/node_modules/todomvc-app-css/index.css"
 
-          mountComponent (toElement body) () todoMvc
-          pure ()
+           mountComponent (toElement body) () todoMvc
+           pure ()
+
+main :: IO ()
+#ifdef __GHCJS__
+main = start
+#else
+main = Warp.run 9102 start
+#endif
 
 data TodoItem = TodoItem { todoItemComplete :: Bool, todoItemName :: String } deriving Show
 data TodoItemList = TodoItemList { todoListEditing :: Maybe Int, todoListItems :: V.Vector TodoItem } deriving Show
 
---todoMvc :: Component (EnterExi TodoItemList IO) IO
-todoMvc = statefulComp (\_ -> TodoItemList Nothing mempty) () (\_ _ -> pure ()) (\_ -> pure ()) $
+-- todoMvc :: Component (EnterExi TodoItemList IO) IO
+todoMvc = statefulComp @DOMImpl (\_ -> TodoItemList Nothing mempty) () (\_ _ -> pure ()) (\_ -> pure ()) $
           (div_
           |- (section_ |+ class_ ("todoapp" :: JSString)
 
@@ -96,7 +109,7 @@ todoMvc = statefulComp (\_ -> TodoItemList Nothing mempty) () (\_ _ -> pure ()) 
                  val <- getValue (uncheckedCastTo HTMLInputElement tgt)
 
                  when (kc == 13) $
-                   do liftIO (setValue tgt ("" :: JSString))
+                   do liftDom (setValue tgt ("" :: JSString))
                       updateComponent (insertTodoItem val)
 
 --          itemToggled :: (forall a. StateT TodoItemList IO a -> EventM Element MouseEvent a) -> Embedded Int TodoItemList TodoItem -> EventM Element MouseEvent ()
@@ -128,9 +141,6 @@ todoMvc = statefulComp (\_ -> TodoItemList Nothing mempty) () (\_ _ -> pure ()) 
                                                                                            , todoListItems = uncurry mappend (second tailIfNecy (V.splitAt (index st) (todoListItems todoList))) }
           tailIfNecy x | V.null x = mempty
                        | otherwise = V.tail x
-#else
 
-main :: IO ()
-main = return ()
 
-#endif
+

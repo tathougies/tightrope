@@ -30,7 +30,9 @@ import Web.Tightrope.Lifecycle
 import Web.Tightrope.HTML hiding (style_, title_)
 import Web.Tightrope.HTML.Attributes hiding (cite_, dir_, form_, label_, span_, em_)
 
-import Web.Tightrope.Types hiding (Text, Node)
+import Web.Tightrope.Types hiding ( Node, RunAlgebra, EnterExit, EnterExitT
+                                  , GenericRunAlgebra, EmbeddedAlgebraWrapper
+                                  , liftDom )
 
 #ifdef __GHCJS__
 import Web.Tightrope.JS hiding (drop)

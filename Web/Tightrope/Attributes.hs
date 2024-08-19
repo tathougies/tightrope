@@ -82,7 +82,7 @@ type family AttrStrategy x :: AttributeStrategy where
 
 class Attrable (strategy :: AttributeStrategy ) x st where
     attr' :: TightropeImpl impl => Proxy strategy
-          -> (Proxy impl -> Node impl -> Text impl -> Maybe (Text impl) -> IO ())
+          -> (Proxy impl -> Node impl -> Text impl -> Maybe (Text impl) -> DomM impl ())
           -> Text impl -> x
           -> Attribute' impl out st algebra
 
@@ -170,8 +170,9 @@ initialValue_ :: forall impl strategy x out st algebra.
               -> Attribute' impl out st algebra
 initialValue_ v = keyedAttr_ (\_ -> ()) (attr (fromString "value") v)
 
-keyedAttr_ :: forall impl key out st algebra.
-              Eq key => (st -> key)
+keyedAttr_ :: forall impl key out st algebra
+            . (Monad (DomM impl), Eq key)
+           => (st -> key)
            -> Attribute' impl out st algebra
            -> Attribute' impl out st algebra
 keyedAttr_ mkKey (Attribute go) =

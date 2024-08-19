@@ -1,3 +1,6 @@
+{-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
@@ -10,10 +13,12 @@ import           Control.Applicative
 import           Control.Concurrent.MVar
 import           Control.Exception (evaluate)
 import           Control.Lens
+import           Control.Monad.Catch (MonadMask)
 import           Control.Monad.IO.Class
 import           Control.Monad.Identity
 import           Control.Monad.Reader
 import           Control.Monad.State
+import           Control.Monad.Writer
 
 import           Data.IORef
 import           Data.Int
@@ -23,10 +28,9 @@ import           Data.String
 import qualified Data.Text as T
 import           Data.Typeable
 import           Data.Word
-#ifdef __GHCJS__
 import           Data.JSString (JSString)
 import           Data.JSString.Text (textToJSString, textFromJSString)
-#endif
+import           Language.Javascript.JSaddle (FromJSString, MonadJSM(..))
 
 import           System.Mem.StableName
 
@@ -42,7 +46,6 @@ class AttrValue x where
 
     attrValue :: TightropeImpl impl => Proxy impl -> Text impl -> x -> (AttrValueState x, Maybe (Text impl))
 
-#ifdef __GHCJS__
 instance IsText JSString where
     fromText = textToJSString
     toText = textFromJSString
@@ -56,7 +59,6 @@ instance IsJSS T.Text where
 instance IsJSS JSString where
     fromJSS = id
     toJSS = id
-#endif
 
 class RawIO m where
     rawIO :: IO a -> m a
@@ -66,60 +68,83 @@ class ( Monoid (Text impl), Eq (Text impl)
 #ifdef __GHCJS__
       , IsJSS (Text impl)
 #endif
-      , AttrValue (Text impl)
-      , Typeable impl) => TightropeImpl impl where
+     , FromJSString (Text impl)
+     , AttrValue (Text impl)
+     , Typeable impl
+     , MonadIO (DomM impl), MonadFail (DomM impl), RawIO (DomM impl)
+     , MonadMask (DomM impl), MonadDom impl (DomM impl) ) => TightropeImpl impl where
     type Node impl  :: *
     type Text impl  :: *
     data Event impl :: * -> *
+    type DomM impl :: * -> *
 
-    createElement  :: Proxy impl -> Text impl -> IO (Node impl)
-    createTextNode :: Proxy impl -> Text impl -> IO (Node impl)
+    createElement  :: Proxy impl -> Text impl -> DomM impl (Node impl)
+    createTextNode :: Proxy impl -> Text impl -> DomM impl (Node impl)
 
-    addEventListener :: Node impl -> Event impl e -> ReaderT e IO () -> IO (IO ())
-    addBodyEventListener :: Event impl e -> ReaderT e IO () -> IO (IO ())
-    addResizeListener :: Proxy impl -> ((Double, Double) -> IO ()) -> IO (IO ())
+    addEventListener :: Node impl -> Event impl e -> ReaderT e (DomM impl) () -> DomM impl (DomM impl ())
+    addBodyEventListener :: Event impl e -> ReaderT e (DomM impl) () -> DomM impl (DomM impl ())
+    addResizeListener :: Proxy impl -> ((Double, Double) -> DomM impl ()) -> DomM impl (DomM impl ())
 
-    insertAtPos    :: Proxy impl -> DOMInsertPos impl -> Node impl -> IO (DOMInsertPos impl)
-    removeChild    :: Proxy impl -> Node impl -> IO ()
+    insertAtPos    :: Proxy impl -> DOMInsertPos impl -> Node impl -> DomM impl (DOMInsertPos impl)
+    removeChild    :: Proxy impl -> Node impl -> DomM impl ()
 
-    addClasses :: Proxy impl -> Node impl -> Text impl -> IO ()
-    enableClass    :: Proxy impl -> Node impl -> Text impl -> IO ()
-    disableClass   :: Proxy impl -> Node impl -> Text impl -> IO ()
+    addClasses :: Proxy impl -> Node impl -> Text impl -> DomM impl ()
+    enableClass    :: Proxy impl -> Node impl -> Text impl -> DomM impl ()
+    disableClass   :: Proxy impl -> Node impl -> Text impl -> DomM impl ()
 
-    setAttribute   :: Proxy impl -> Node impl -> Text impl -> Maybe (Text impl) -> IO ()
-    setStyle       :: Proxy impl -> Node impl -> Text impl -> Maybe (Text impl) -> IO ()
-    setNodeValue   :: Proxy impl -> Node impl -> Text impl -> IO ()
+    setAttribute   :: Proxy impl -> Node impl -> Text impl -> Maybe (Text impl) -> DomM impl ()
+    setStyle       :: Proxy impl -> Node impl -> Text impl -> Maybe (Text impl) -> DomM impl ()
+    setNodeValue   :: Proxy impl -> Node impl -> Text impl -> DomM impl ()
 
-    requestFrame   :: Proxy impl -> (Double -> IO ()) -> IO ()
+    requestFrame   :: Proxy impl -> (Double -> DomM impl ()) -> DomM impl ()
 
-type RunAlgebra algebra = forall a. algebra a -> IO a
-type GenericRunAlgebra algebra = forall a m. MonadIO m => algebra a -> m a
+    getIORunner :: DomM impl (IORunner impl)
 
-data EnterExit state out m m' = EnterExit (state -> IO ()) (IO state) (RunAlgebra m) (RunAlgebra m')
+class Monad m => MonadDom impl m where
+    liftDom :: Proxy impl -> DomM impl a -> m a
 
-newtype RunAlgebraWrapper algebra = RunAlgebraWrapper (RunAlgebra algebra)
-newtype EmbeddedAlgebraWrapper algebra (parentAlgebra :: * -> *) =
-    EmbeddedAlgebraWrapper (forall a m. MonadIO m => algebra a -> m a)
-newtype EnterExitT state out m a = EnterExitT { runEnterExitT :: EnterExit state out m (EnterExitT state out m) -> out -> state -> IO (a, state) }
+newtype IORunner impl = IORunner (forall a. DomM impl a -> IO a)
+
+type RunAlgebra impl algebra = forall a. algebra a -> DomM impl a
+type GenericRunAlgebra impl algebra = forall a m. MonadDom impl m => algebra a -> m a
+
+data EnterExit impl state out m m' = EnterExit (state -> DomM impl ()) (DomM impl state) (RunAlgebra impl m) (RunAlgebra impl m')
+
+newtype RunAlgebraWrapper impl algebra = RunAlgebraWrapper (RunAlgebra impl algebra)
+newtype EmbeddedAlgebraWrapper impl algebra (parentAlgebra :: * -> *) =
+    EmbeddedAlgebraWrapper (forall a m. MonadDom impl m => algebra a -> m a)
+newtype EnterExitT impl state out m a = EnterExitT { runEnterExitT :: EnterExit impl state out m (EnterExitT impl state out m) -> out -> state -> DomM impl (a, state) }
+
+instance (MonadDom impl m, MonadDom impl (DomM impl)) => MonadDom impl (EnterExitT impl st out m) where
+    liftDom _ x = EnterExitT $ \_ _ !st -> (,st) <$> liftDom (Proxy @impl) x
+
+instance MonadDom impl m => MonadDom impl (ReaderT r m) where
+    liftDom p = lift . liftDom p
+instance (MonadDom impl m, Monoid r) => MonadDom impl (WriterT r m) where
+    liftDom p = lift . liftDom p
+instance MonadDom impl m => MonadDom impl (StateT r m) where
+    liftDom p = lift . liftDom p
 
 data DOMInsertPos impl
     = DOMInsertPos
     { insertPosParent :: Node impl
     , insertPosPrevSibling :: Maybe (Node impl) }
 
-newtype AfterAction out = AfterAction [ out -> IO () ]
+newtype AfterAction impl out = AfterAction [ out -> DomM impl () ]
 
-newtype Snippet' impl out state algebra = Snippet (RunAlgebra algebra -> state -> IO state -> DOMInsertPos impl -> IO (ConstructedSnippet impl out state algebra))
+newtype Snippet' impl out state algebra = Snippet (RunAlgebra impl algebra -> state -> DomM impl state -> DOMInsertPos impl -> DomM impl (ConstructedSnippet impl out state algebra))
 data ConstructedSnippet impl out state algebra
     = ConstructedSnippet
     { constructedSnippetOut  :: Endo out
-    , constructedAfterAction :: AfterAction out
+    , constructedAfterAction :: AfterAction impl out
     , constructedSiblingPos  :: DOMInsertPos impl
     , constructedChildPos    :: DOMInsertPos impl
     , constructedSnippetNext :: Snippet' impl out state algebra
-    , constructedSnippetFinish :: IO () }
+    , constructedSnippetFinish :: DomM impl () }
 
-newtype Attribute' impl out st algebra = Attribute (Snippet' impl out st algebra) deriving Monoid
+newtype Attribute' impl out st algebra = Attribute (Snippet' impl out st algebra)
+deriving newtype instance (Monad (DomM impl)) => Monoid (Attribute' impl out st algebra)
+deriving newtype instance (Monad (DomM impl)) => Semigroup (Attribute' impl out st algebra)
 
 type GenericSnippet = forall impl st out algebra. TightropeImpl impl => Snippet' impl st out algebra
 
@@ -127,8 +152,8 @@ data Component' impl props (algebra :: * -> *) (parentAlgebra :: * -> *) where
     Component :: (MonadIO parentAlgebra, Typeable state, Typeable out) =>
                  { componentInitState     :: props -> state
                  , componentEmptyOut      :: out
-                 , componentRunAlgebra    :: forall a. EnterExit state out parentAlgebra algebra -> state -> out -> algebra a -> IO (a, state)
-                 , componentOnConstruct   :: RunAlgebra algebra -> props -> algebra ()
+                 , componentRunAlgebra    :: forall a. EnterExit impl state out parentAlgebra algebra -> state -> out -> algebra a -> DomM impl (a, state)
+                 , componentOnConstruct   :: RunAlgebra impl algebra -> props -> algebra ()
                  , componentOnPropsUpdate :: props -> algebra ()
                  , componentTemplate      :: Snippet' impl out state algebra }
               -> Component' impl props algebra parentAlgebra
@@ -139,9 +164,9 @@ data MountedComponent impl algebra parentAlgebra where
                         , mountedOutV           :: IORef out
                         , mountedInsPosV        :: MVar (DOMInsertPos impl, DOMInsertPos impl, DOMInsertPos impl)
                         , mountedEmptyOut       :: out
-                        , mountedAlgebraWrapper :: EmbeddedAlgebraWrapper algebra parentAlgebra
+                        , mountedAlgebraWrapper :: EmbeddedAlgebraWrapper impl algebra parentAlgebra
                         , mountedFinish         :: IO ()
-                        , mountedRunAlgebra     :: forall a. EnterExit state out parentAlgebra algebra -> state -> out -> algebra a ->  IO (a, state)
+                        , mountedRunAlgebra     :: forall a. EnterExit impl state out parentAlgebra algebra -> state -> out -> algebra a ->  IO (a, state)
                         , mountedTemplate       :: Snippet' impl out state algebra }
                      -> MountedComponent impl algebra parentAlgebra
 
@@ -150,9 +175,10 @@ data Embedded index parent current
                , current :: current
                , index :: index }
 
-instance Monoid (AfterAction out) where
+instance Monoid (AfterAction impl out) where
     mempty = AfterAction []
-    mappend (AfterAction a) (AfterAction b) = AfterAction (a <> b)
+instance Semigroup (AfterAction impl out) where
+    AfterAction a <> AfterAction b = AfterAction (a <> b)
 
 parent_ :: Lens (Embedded idx parent child) (Embedded idx parent' child) parent parent'
 parent_ = lens get set
@@ -172,18 +198,20 @@ index_ = lens get set
 set_ :: Setter' s (Maybe a) -> a -> s -> s
 set_ loc val = loc ?~ val
 
-runAfterAction :: AfterAction out -> out -> IO ()
+runAfterAction :: Monad (DomM impl) => AfterAction impl out -> out -> DomM impl ()
 runAfterAction act out = go' act out
     where go' (AfterAction []) out = pure ()
           go' (AfterAction (x:xs)) out = x out >> go' (AfterAction xs) out
 
-emptySnippet :: Snippet' impl out state algebra
+emptySnippet :: Monad (DomM impl) => Snippet' impl out state algebra
 emptySnippet = Snippet $ \_ _ _ pos ->
                pure (ConstructedSnippet mempty mempty pos pos emptySnippet (return ()))
 
-instance Monoid (Snippet' impl out state m) where
+instance Monad (DomM impl) => Monoid (Snippet' impl out state m) where
     mempty = emptySnippet
-    mappend (Snippet left) (Snippet right) =
+
+instance Monad (DomM impl) => Semigroup (Snippet' impl out state m) where
+    Snippet left <> Snippet right =
         Snippet $ \runAlgebra st getSt siblingPos ->
             do ConstructedSnippet leftOut leftScheduled siblingPos' _ left' finishLeft <-
                    left runAlgebra st getSt siblingPos
@@ -194,35 +222,40 @@ instance Monoid (Snippet' impl out state m) where
 
 -- * EnterExit monad
 
-instance Monad m => Functor (EnterExitT state out m) where
+instance (Monad m, Monad (DomM impl)) => Functor (EnterExitT impl state out m) where
     fmap f a = do x <- a
                   return (f x)
-instance Monad m => Applicative (EnterExitT state out m) where
+instance (Monad m, Monad (DomM impl)) => Applicative (EnterExitT impl state out m) where
     pure = return
     f <*> x = do f' <- f
                  x' <- x
                  return (f' x')
-instance Monad m => Monad (EnterExitT state out m) where
+instance (Monad m, Monad (DomM impl)) => Monad (EnterExitT impl state out m) where
     a >>= b =
         EnterExitT $ \ee out st ->
         do (x, !st') <- runEnterExitT a ee out st
            runEnterExitT (b x) ee out st'
     return x = EnterExitT $ \_ _ st -> return (x, st)
-instance Monad m => MonadIO (EnterExitT state out m) where
+instance (MonadFail m, MonadFail (DomM impl)) => MonadFail (EnterExitT impl state out m) where
+    fail k = EnterExitT $ \_ _ _ -> fail k
+instance (Monad m, MonadJSM (DomM impl)) => MonadJSM (EnterExitT impl state out m) where
+    liftJSM' f = EnterExitT $ \_ _ !st ->
+                 (,st) <$> liftJSM' f
+instance (Monad m, MonadIO (DomM impl)) => MonadIO (EnterExitT impl state out m) where
     liftIO f = EnterExitT $ \(EnterExit saveState fetchState runParent _) out !st ->
                do saveState st
-                  x <- f
+                  x <- liftIO f
                   st' <- fetchState
                   return (x, st')
-instance RawIO (EnterExitT state out m) where
+instance (Functor (DomM impl), RawIO (DomM impl)) => RawIO (EnterExitT impl state out m) where
     rawIO f = EnterExitT $ \ee out st ->
               fmap (,st) (rawIO f)
-instance Monad m => MonadReader out (EnterExitT state out m) where
+instance (Monad m, Monad (DomM impl)) => MonadReader out (EnterExitT impl state out m) where
     local f act =
         EnterExitT $ \ee out st ->
             runEnterExitT act ee (f out) st
     ask = EnterExitT $ \ee out st -> return (out, st)
-instance Monad m => MonadState state (EnterExitT state out m) where
+instance (Monad m, Monad (DomM impl)) => MonadState state (EnterExitT impl state out m) where
     state f =
         EnterExitT $ \ee out st ->
             pure (f st)
@@ -234,11 +267,12 @@ instance (RawIO m, Monad m) => RawIO (ReaderT r m) where
 instance (RawIO m, Monad m) => RawIO (StateT s m) where
     rawIO = lift . rawIO
 
-getUpdater :: MonadIO m => EnterExitT state out m (RunAlgebraWrapper (EnterExitT state out m))
+getUpdater :: (MonadIO m, Monad (DomM impl))
+           => EnterExitT impl state out m (RunAlgebraWrapper impl (EnterExitT impl state out m))
 getUpdater = EnterExitT $ \(EnterExit _ _ _ update) out st ->
              pure (RunAlgebraWrapper update, st)
 
-parentComponent :: MonadIO m => m a -> EnterExitT state out m a
+parentComponent :: (MonadIO m, Monad (DomM impl)) => m a -> EnterExitT impl state out m a
 parentComponent action =
     EnterExitT $ \(EnterExit saveState fetchState runParent _) out !st ->
     do saveState st
@@ -250,10 +284,14 @@ parentComponent action =
 
 data DummyImpl
 
+instance MonadDom DummyImpl IO where
+    liftDom _ = id
+
 instance TightropeImpl DummyImpl where
     type Node DummyImpl = ()
     type Text DummyImpl = T.Text
     data Event DummyImpl e = DummyEvent
+    type DomM DummyImpl = IO
 
     createElement _ _ = pure ()
     createTextNode _ _ = pure ()

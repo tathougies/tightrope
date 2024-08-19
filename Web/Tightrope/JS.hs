@@ -1,3 +1,5 @@
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
@@ -5,7 +7,9 @@
 module Web.Tightrope.JS
     ( DOMImpl
     , Snippet, Attribute, Component
-    , Node
+    , Node, RunAlgebra, EnterExit, EnterExitT
+    , GenericRunAlgebra, EmbeddedAlgebraWrapper
+    , RunAlgebraWrapper
 
     , TT.TightropeEventImpl(..)
 
@@ -16,19 +20,25 @@ module Web.Tightrope.JS
 
     , customHandler
 
-    , withDOMImpl ) where
+    , withDOMImpl
+    , liftDom ) where
 
 import           Prelude hiding (drop)
 
-import           Web.Tightrope.Types hiding (Node)
+import           Web.Tightrope.Types hiding ( Node, RunAlgebra, EnterExit, EnterExitT
+                                            , GenericRunAlgebra, EmbeddedAlgebraWrapper
+                                            , RunAlgebraWrapper
+                                            , liftDom )
 import qualified Web.Tightrope.Types as TT
 import qualified Web.Tightrope.Event as TT
 import           Web.Tightrope.Attributes
 
-import           Control.Concurrent.MVar
-import           Control.Exception (bracket)
+import           Control.Concurrent.MVar hiding (modifyMVar, modifyMVar_)
+import           Control.Monad.Catch (MonadMask, mask, onException, bracket)
 import           Control.Monad
 import           Control.Monad.Reader
+import           Control.Monad.Writer (WriterT)
+import           Control.Monad.State (StateT)
 
 import           Data.Coerce
 import           Data.IORef
@@ -56,19 +66,44 @@ import qualified GHCJS.DOM.GlobalEventHandlers as DOM (resize)
 import qualified GHCJS.DOM.RequestAnimationFrameCallback as DOM
 import qualified GHCJS.DOM.DOMTokenList as TokenList
 import           GHCJS.DOM.CSSStyleDeclaration as DOM hiding (getLength, item)
-import qualified GHCJS.Foreign.Callback as DOM
 import qualified GHCJS.Types as DOM
+
+import qualified Language.Javascript.JSaddle as JS
 
 import           System.Mem.StableName
 import           System.IO.Unsafe
 
+#ifndef __GHCJS__
+import qualified Data.HashMap.Strict as HM
+import           Data.Int (Int64)
+import           Data.Maybe (fromMaybe)
+#endif
+
 data DOMImpl
+
+liftDom :: MonadDom DOMImpl m => JS.JSM a -> m a
+liftDom = TT.liftDom (Proxy @DOMImpl)
+
+instance RawIO DOM.JSM where
+    rawIO = liftIO
+
+instance MonadDom DOMImpl JS.JSM where
+    liftDom _ = id
 
 instance TightropeImpl DOMImpl where
     type Node DOMImpl = DOM.Node
     type Text DOMImpl = JSString
     data Event DOMImpl e where
       Event :: Coercible e DOM.Event => JSString -> Event DOMImpl e
+    type DomM DOMImpl = DOM.JSM
+
+#ifdef __GHCJS__
+    getIORunner = pure (IORunner id)
+#else
+    getIORunner = JS.JSM $ do
+                    ref <- ask
+                    pure (IORunner (\f -> runReaderT (JS.unJSM f) ref))
+#endif
 
     createElement _ tagName =
         do Just document <- DOM.currentDocument
@@ -80,16 +115,16 @@ instance TightropeImpl DOMImpl where
            pure (DOM.toNode t)
 
     addEventListener n (Event evtName :: Event DOMImpl e) action =
-        do let action' :: DOM.Event -> IO ()
+        do let action' :: DOM.Event -> DOM.JSM ()
                action' e =
                  runReaderT action (coerce e)
 
-           listener <- DOM.eventListenerNew action'
-           DOM.addEventListener (DOM.toEventTarget n) evtName (Just listener) False
+           listener <- DOM.newListenerSync (ReaderT action')
+           DOM.addListener (DOM.toEventTarget n) (DOM.unsafeEventName evtName) listener False
 
            pure $ do
-             DOM.removeEventListener (DOM.toEventTarget n) evtName (Just listener) False
-             DOM.eventListenerRelease listener
+             DOM.removeListener (DOM.toEventTarget n) (DOM.unsafeEventName evtName) listener False
+             DOM.releaseListener listener
 
     addBodyEventListener e action =
         do Just document <- DOM.currentDocument
@@ -101,7 +136,7 @@ instance TightropeImpl DOMImpl where
            DOM.on window DOM.resize $ do
              dims <- (,) <$> (fromIntegral <$> DOM.getInnerWidth  window)
                          <*> (fromIntegral <$> DOM.getInnerHeight window)
-             liftIO (action dims)
+             lift (action dims)
 
     insertAtPos _ (DOMInsertPos parent Nothing) child =
         do children <- DOM.getChildNodes parent
@@ -163,7 +198,7 @@ instance TightropeImpl DOMImpl where
 
     setStyle _ n key Nothing =
         do style <- DOM.getStyle (DOM.uncheckedCastTo DOM.ElementCSSInlineStyle n)
-           DOM.removeProperty style key :: IO JSString
+           DOM.removeProperty style key :: DOM.JSM JSString
            pure ()
     setStyle _ n key (Just value) =
         do style <- DOM.getStyle (DOM.uncheckedCastTo DOM.ElementCSSInlineStyle n)
@@ -178,7 +213,7 @@ instance TightropeImpl DOMImpl where
 instance AttrValue JSString where
     type AttrValueState JSString = JSString
 
-    attrValue _ _ x = (x, Just . fromJSS $ x)
+    attrValue _ _ x = (x, Just . JS.fromJSString $ x)
 
 -- * Specializations
 
@@ -186,13 +221,19 @@ type Snippet = Snippet' DOMImpl
 type Attribute = Attribute' DOMImpl
 type Component = Component' DOMImpl
 type Node = TT.Node DOMImpl
+type RunAlgebra x = TT.RunAlgebra DOMImpl x
+type RunAlgebraWrapper x = TT.RunAlgebraWrapper DOMImpl x
+type GenericRunAlgebra x = TT.GenericRunAlgebra DOMImpl x
+type EmbeddedAlgebraWrapper = TT.EmbeddedAlgebraWrapper DOMImpl
+type EnterExit = TT.EnterExit DOMImpl
+type EnterExitT = TT.EnterExitT DOMImpl
 
 -- * Browser DOM-specific utility functions
 
 jss :: JSString -> JSString
 jss = id
 
-addStylesheet :: JSString -> IO ()
+addStylesheet :: JSString -> DOM.JSM ()
 addStylesheet loc =
     do Just document <- DOM.currentDocument
        Just head <- DOM.getHead document
@@ -207,14 +248,45 @@ addStylesheet loc =
 
 -- * Top-level component attachment
 
+#ifdef __GHCJS__
 {-# NOINLINE _animFrameCallbackVar #-}
-_animFrameCallbackVar :: MVar (Maybe DOM.RequestAnimationFrameCallback, Maybe Int, [ Double -> IO () ])
+_animFrameCallbackVar :: MVar (Maybe DOM.RequestAnimationFrameCallback, Maybe Int, [ Double -> DOM.JSM () ])
 _animFrameCallbackVar =
     unsafePerformIO (newMVar (Nothing, Nothing, mempty))
+#else
+{-# NOINLINE _animFrameCallbackVar #-}
+_animFrameCallbackVar :: MVar (HM.HashMap Int64 (Maybe DOM.RequestAnimationFrameCallback, Maybe Int, [ Double -> DOM.JSM () ]))
+_animFrameCallbackVar =
+    unsafePerformIO (newMVar mempty)
+#endif
 
-requestAnimationFrameHs :: (Double -> IO ()) -> IO ()
+modifyMVar :: (MonadMask m, MonadIO m) => MVar a -> (a -> m (a, b)) -> m b
+modifyMVar var x = mask $ \unmask -> do
+                     val <- liftIO (takeMVar var)
+                     (val', ret) <- x val `onException` liftIO (putMVar var val)
+                     liftIO (putMVar var val')
+                     pure ret
+
+
+modifyMVar_ :: (MonadMask m, MonadIO m) => MVar a -> (a -> m a) -> m ()
+modifyMVar_ var x = modifyMVar var (\a -> do
+                                      a' <- x a
+                                      pure (a', ()))
+
+#ifdef __GHCJS__
+modifyInContext = id
+#else
+modifyInContext go v = do
+  ctx <- JS.askJSM
+  let vars = HM.lookup (JS.contextId ctx) v
+  (new, ret) <- go (fromMaybe (Nothing, Nothing, mempty) vars)
+  let v' = HM.insert (JS.contextId ctx) new v
+  v' `seq` pure (v', ret)
+#endif
+
+requestAnimationFrameHs :: (Double -> DOM.JSM ()) -> DOM.JSM ()
 requestAnimationFrameHs doDraw = do
-  modifyMVar_ _animFrameCallbackVar $ \(cb, existing, reqs) ->
+  modifyMVar _animFrameCallbackVar . modifyInContext $ \(cb, existing, reqs) ->
     do let reqs' = doDraw:reqs
 
        cb' <-
@@ -227,11 +299,11 @@ requestAnimationFrameHs doDraw = do
              Nothing -> do
                Just window <- DOM.currentWindow
                Just <$> DOM.requestAnimationFrame window cb'
-       pure (reqs' `seq` (Just cb', existing', reqs'))
+       pure (reqs' `seq` (Just cb', existing', reqs'), ())
 
   where
     _doRedraw ts =
-        do reqs <- modifyMVar _animFrameCallbackVar $ \(cb, existing, reqs) ->
+        do reqs <- modifyMVar _animFrameCallbackVar . modifyInContext $ \(cb, existing, reqs) ->
                    if null reqs
                       then pure ((cb, Nothing, mempty), mempty)
                       else pure ((cb, existing, mempty), reqs)
@@ -241,61 +313,61 @@ requestAnimationFrameHs doDraw = do
                   req ts
                 _doRedraw ts
 
-mountComponent :: DOM.Element -> props -> Component props algebra IO -> IO (props -> IO ())
+mountComponent :: DOM.Element -> props -> Component props algebra DOM.JSM -> DOM.JSM (props -> DOM.JSM ())
 mountComponent el initialProps (Component mkSt emptyOut runAlgebra onCreate onPropsChange (Snippet create :: Snippet out st algebra))  =
-  do stVar <- newEmptyMVar
-     intStVar <- newIORef (error "intStVar not set")
-     outVar <- newIORef (error "outVar not set")
-     syncVar <- newMVar ()
+  do stVar <- liftIO $ newEmptyMVar
+     intStVar <- liftIO $ newIORef (error "intStVar not set")
+     outVar <- liftIO $ newIORef (error "outVar not set")
+     syncVar <- liftIO $ newMVar ()
 
      Just window <- DOM.currentWindow
 
-     isDirtyV <- newIORef False
-     let redraw _ = do atomicWriteIORef isDirtyV False
+     isDirtyV <- liftIO $ newIORef False
+     let redraw _ = do liftIO (atomicWriteIORef isDirtyV False)
                        (st, (Snippet update, _)) <-
-                           bracket (takeMVar stVar) (putMVar stVar) $ \st ->
-                           (st,) <$> readIORef intStVar
+                           bracket (liftIO $ takeMVar stVar) (liftIO . putMVar stVar) $ \st ->
+                           (st,) <$> liftIO (readIORef intStVar)
 
 
                        ConstructedSnippet (Endo mkOut) scheduled _ _ update' finish <-
-                           update runAlgebra' st (readMVar stVar) (DOMInsertPos (DOM.toNode el) Nothing)
+                           update runAlgebra' st (liftIO $ readMVar stVar) (DOMInsertPos (DOM.toNode el) Nothing)
 
-                       atomicWriteIORef intStVar (update', finish)
+                       liftIO (atomicWriteIORef intStVar (update', finish))
 
                        let out' = mkOut emptyOut
-                       atomicWriteIORef outVar out'
+                       liftIO $ atomicWriteIORef outVar out'
 
                        runAfterAction scheduled out'
 
-         runAlgebra' :: forall a. algebra a -> IO a
+         runAlgebra' :: forall a. algebra a -> DOM.JSM a
          runAlgebra' a =
 
              do (x, shouldRedraw) <- modifyMVar stVar $ \st ->
-                     do out <- readIORef outVar
+                     do out <- liftIO $ readIORef outVar
 --                        (update', finish) <- readIORef intStVar
-                        oldStNm <- makeStableName st
-                        (x, !st') <- runAlgebra (EnterExit (putMVar stVar) (takeMVar stVar) id runAlgebra') st out a
-                        newStNm <- makeStableName st'
+                        oldStNm <- liftIO $ makeStableName st
+                        (x, !st') <- runAlgebra (TT.EnterExit (liftIO . putMVar stVar) (liftIO $ takeMVar stVar) id runAlgebra') st out a
+                        newStNm <- liftIO $ makeStableName st'
                         pure (st', (x, oldStNm /= newStNm))
 
                 when shouldRedraw scheduleRedraw
 
                 pure x
          scheduleRedraw = do
-           wasDirty <- atomicModifyIORef isDirtyV (\isDirty -> (True, isDirty))
+           wasDirty <- liftIO (atomicModifyIORef isDirtyV (\isDirty -> (True, isDirty)))
            when (not wasDirty) (requestAnimationFrameHs redraw)
 
-         getSt = readMVar stVar
+         getSt = liftIO (readMVar stVar)
          initialState = mkSt initialProps
 
-     putMVar stVar initialState
+     liftIO $ putMVar stVar initialState
      ConstructedSnippet (Endo mkOut) scheduled _ _ update finish <-
          create runAlgebra' initialState getSt (DOMInsertPos (DOM.toNode el) Nothing)
 
-     atomicWriteIORef intStVar (update, finish)
+     liftIO $ atomicWriteIORef intStVar (update, finish)
 
      let !initialOut = mkOut emptyOut
-     atomicWriteIORef outVar initialOut
+     liftIO $ atomicWriteIORef outVar initialOut
 
      runAfterAction scheduled initialOut
      runAlgebra' (onCreate runAlgebra' initialProps)
@@ -346,16 +418,16 @@ instance TT.TightropeEventImpl DOMImpl where
 
 customHandler ::
      forall evt out state algebra.
-     (Node -> DOM.Callback (DOM.JSVal -> IO ()) -> IO ())
-  -> (Node -> DOM.Callback (DOM.JSVal -> IO ()) -> IO ())
-  -> (RunAlgebra algebra -> state -> DOM.JSVal -> IO ())
+     (Node -> JS.JSVal -> DOM.JSM ())
+  -> (Node -> JS.JSVal -> DOM.JSM ())
+  -> (RunAlgebra algebra -> state -> DOM.JSVal -> DOM.JSM ())
   -> Attribute out state algebra
 customHandler attachHandler detachHandler handler =
     Attribute $
     Snippet (\run st getSt pos@(DOMInsertPos n _) -> do
                let handler' e = getSt >>= \st -> handler run st e
 
-               listener <- DOM.syncCallback1 DOM.ContinueAsync handler'
+               listener <- JS.toJSVal (JS.fun $ \_ _ [e] -> handler' e)
                attachHandler n listener
 
                let finish = detachHandler n listener
